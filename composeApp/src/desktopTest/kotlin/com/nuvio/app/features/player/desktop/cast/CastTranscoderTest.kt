@@ -77,6 +77,44 @@ class CastTranscoderTest {
     }
 
     @Test
+    fun `burning subtitles re-encodes the video with the subtitles filter`() {
+        val args = CastTranscoder.buildArguments(
+            "ffmpeg",
+            CastTranscodeSpec(
+                inputUrl = "https://debrid.example/dl/abc",
+                headers = emptyMap(),
+                startMs = 30_000L,
+                audioTrackIndex = 0,
+                videoCodec = "hevc",
+                burnSubtitlesFile = java.io.File("/tmp/cast-subtitles/burn-1.vtt"),
+                subtitleStyle = CastTextTrackStyle("#FFFF00FF", "#000000FF", 1.5f, bold = true),
+                videoEncoder = "h264_nvenc",
+            ),
+        )
+
+        val filter = args[args.indexOf("-vf") + 1]
+        // A bare file name: ffmpeg runs in the subtitle's directory, so no path escaping is needed.
+        assertTrue(filter.contains("subtitles=filename=burn-1.vtt:force_style='"), filter)
+        assertTrue(filter.startsWith("scale=-2:'min(1080,ih)',format=yuv420p,"), filter)
+        assertTrue(args.containsSequence("-c:v", "h264_nvenc"))
+        assertFalse(args.containsSequence("-c:v", "copy"))
+        assertFalse("-tag:v" in args)
+        assertTrue(args.containsSequence("-c:a", "aac"))
+    }
+
+    @Test
+    fun `subtitle style maps to libass overrides`() {
+        assertEquals("&H0000FFFF", CastTranscoder.assColour("#FFFF00FF"))
+        assertEquals("&H80FFFFFF", CastTranscoder.assColour("#FFFFFF7F"))
+        assertEquals("&H00563412", CastTranscoder.assColour("#123456"))
+        assertEquals(
+            "FontSize=27,PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=1.5,Bold=1",
+            CastTranscoder.assForceStyle(CastTextTrackStyle("#FFFF00FF", "#000000FF", 1.5f, bold = true)),
+        )
+        assertTrue(CastTranscoder.assForceStyle(CastTextTrackStyle("#FFFFFFFF", null, 1f, bold = false)).contains("Outline=0"))
+    }
+
+    @Test
     fun `probe output gives duration and video codec`() {
         val output = """
             Input #0, matroska,webm, from 'https://debrid.example/dl/abc':

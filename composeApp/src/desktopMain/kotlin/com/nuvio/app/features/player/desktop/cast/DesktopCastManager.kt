@@ -104,6 +104,11 @@ internal object DesktopCastManager {
     /** Source position where the converted stream starts; the receiver's clock starts at zero there. */
     @Volatile private var streamOffsetMs = 0L
     @Volatile private var convertedDurationMs = 0L
+    /** Subtitle drawn into the converted video, or null when none is burned in. */
+    @Volatile private var burnedSubtitleKey: Pair<Triple<String?, Int, String?>, CastTextTrackStyle?>? = null
+    @Volatile private var burnNoticeKey: String? = null
+    @Volatile private var burnFile: File? = null
+    @Volatile private var sideLoadActivationNudged = false
     @Volatile private var sessionEndedListener: ((positionMs: Long, wasPlaying: Boolean, reason: String?) -> Unit)? = null
 
     val isCasting: Boolean
@@ -220,10 +225,17 @@ internal object DesktopCastManager {
         val media = currentMedia ?: return
         worker.execute {
             if (state.connectionState != CastConnectionState.Connected) return@execute
-            val key = subtitles.sideLoadKey()
+            val reload = when {
+                // Burned-in subtitles are part of the picture: any change (including turning
+                // them off) means re-encoding from the current position.
+                burnedSubtitleKey != null -> subtitles.burnKey() != burnedSubtitleKey
+                subtitles.externalUrl != null && transcoder.isAvailable -> true
+                subtitles.externalUrl != null -> subtitles.sideLoadKey() != loadedSubtitleKey
+                else -> false
+            }
             when {
-                subtitles.externalUrl != null && key != loadedSubtitleKey -> {
-                    // A side-loaded track can only be attached by (re)loading the media.
+                reload -> {
+                    // Side-loaded and burned-in subtitles can only change by (re)loading the media.
                     val status = sourceStatus(active)
                     runCatching {
                         loadMedia(
@@ -346,7 +358,20 @@ internal object DesktopCastManager {
         // Whatever was converting for the previous media or position is no longer wanted.
         mediaServer.stopProcessStreams()
         val needsConversion = CastTranscoder.needsAudioConversion(media.audioTrackLabel)
-        val convert = needsConversion && transcoder.isAvailable
+        val canConvert = transcoder.isAvailable
+        // A subtitle enabled in the player is drawn into the picture when ffmpeg is available:
+        // the receiver then only has to play video. Re-encoded video starts exactly at
+        // positionMs, so the cues are shifted by that much.
+        val burnVtt = subtitles.externalUrl?.takeIf { canConvert }?.let { url ->
+            runCatching { loadSubtitleVtt(url, subtitles.delayMs - positionMs.toInt()) ?: error("No subtitle lines could be read") }
+                .onFailure { error ->
+                    log.w(error) { "could not prepare subtitle for burning in" }
+                    reportError("Couldn't load the selected subtitles for casting.")
+                }
+                .getOrNull()
+        }
+        val burn = burnVtt != null
+        val convert = canConvert && (burn || needsConversion)
         val contentUrl: String
         val contentType: String
         val receiverStartMs: Long
@@ -361,12 +386,16 @@ internal object DesktopCastManager {
                 startMs = positionMs,
                 audioTrackIndex = media.audioTrackIndex,
                 videoCodec = probe.videoCodec,
+                burnSubtitlesFile = burnVtt?.let(::writeBurnSubtitle),
+                subtitleStyle = subtitles.style,
+                videoEncoder = if (burn) transcoder.videoEncoder() else SOFTWARE_H264_ENCODER,
             )
-            // The receiver's zero is the keyframe ffmpeg starts from, not the exact seek point.
-            val streamStartMs = if (positionMs > 0L) {
-                transcoder.keyframeStart(input, media.headers, positionMs) ?: positionMs
-            } else {
-                0L
+            // The receiver's zero is where ffmpeg starts: exactly positionMs when re-encoding,
+            // the keyframe before it when copying the video.
+            val streamStartMs = when {
+                positionMs <= 0L -> 0L
+                burn -> positionMs
+                else -> transcoder.keyframeStart(input, media.headers, positionMs) ?: positionMs
             }
             contentUrl = mediaServer.publishProcessStream(host, "stream.mp4") { transcoder.start(spec) }
             contentType = "video/mp4"
@@ -382,9 +411,12 @@ internal object DesktopCastManager {
             streamOffsetMs = 0L
             convertedDurationMs = 0L
         }
+        burnedSubtitleKey = if (burn) subtitles.burnKey() else null
+        sideLoadActivationNudged = false
         // Cue times follow the stream the receiver plays, which starts at the offset when converting.
         val subtitleShiftMs = subtitles.delayMs - streamOffsetMs.toInt()
-        val sideLoaded = subtitles.externalUrl?.let { url ->
+        // With ffmpeg available subtitles are always burned in; a failed burn would fail here too.
+        val sideLoaded = subtitles.externalUrl?.takeIf { !canConvert }?.let { url ->
             runCatching { loadSubtitleVtt(url, subtitleShiftMs) ?: error("No subtitle lines could be read") }
                 .onFailure { error ->
                     log.w(error) { "could not prepare subtitle for cast" }
@@ -402,12 +434,12 @@ internal object DesktopCastManager {
         }
         hasSideLoadedTrack = sideLoaded != null
         loadedSubtitleKey = if (sideLoaded != null) subtitles.sideLoadKey() else null
-        pendingEmbeddedMatch = sideLoaded == null && subtitles.externalUrl == null && !subtitles.isOff
+        pendingEmbeddedMatch = !burn && sideLoaded == null && subtitles.externalUrl == null && !subtitles.isOff
         // When converting, ffmpeg already picked the audio track.
         pendingAudioTrackIndex = if (convert) 0 else media.audioTrackIndex
         val thisLoad = ++loadGeneration
         log.d {
-            "cast load contentType=$contentType convert=$convert offsetMs=$streamOffsetMs " +
+            "cast load contentType=$contentType convert=$convert burn=$burn offsetMs=$streamOffsetMs " +
                 "subtitles=${sideLoaded != null} audio=${media.audioTrackLabel}"
         }
         active.load(
@@ -424,6 +456,12 @@ internal object DesktopCastManager {
                 textTrackStyle = subtitles.style,
             ),
         )
+        val noticeKey = "${media.url}|${subtitles.externalUrl}"
+        if (burn && noticeKey != burnNoticeKey) {
+            burnNoticeKey = noticeKey
+            audioWarningKey = "${media.url}|${media.audioTrackLabel}"
+            reportError("Adding subtitles to the video for ${active.device.name}. This uses more CPU while casting.")
+        }
         val warningKey = "${media.url}|${media.audioTrackLabel}"
         if (warningKey != audioWarningKey) {
             audioWarningKey = warningKey
@@ -446,6 +484,16 @@ internal object DesktopCastManager {
                     )
                 }
             }, SUBTITLE_FETCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        }
+    }
+
+    /** Writes the shifted subtitle for ffmpeg's subtitles filter, replacing the previous one. */
+    private fun writeBurnSubtitle(vtt: String): File {
+        val dir = DesktopStorage.rootDir.resolve("cast-subtitles").toFile().apply { mkdirs() }
+        burnFile?.delete()
+        return File(dir, "burn-${System.currentTimeMillis()}.vtt").apply {
+            writeText(vtt)
+            burnFile = this
         }
     }
 
@@ -501,6 +549,14 @@ internal object DesktopCastManager {
         val active = session
         if (active != null && pendingEmbeddedMatch) {
             worker.execute { applyEmbeddedMatch(active, status) }
+        }
+        if (
+            active != null && hasSideLoadedTrack && !sideLoadActivationNudged &&
+            status.playerState == CastPlayerState.Playing && SIDE_LOADED_TRACK_ID !in status.activeTrackIds
+        ) {
+            // Some receivers ignore activeTrackIds in LOAD; switch the track on once playing.
+            sideLoadActivationNudged = true
+            worker.execute { active.setActiveTextTracks(listOf(SIDE_LOADED_TRACK_ID), currentSubtitles.style) }
         }
         if (active != null && pendingAudioTrackIndex > 0 && status.receiverAudioTracks.isNotEmpty()) {
             val index = pendingAudioTrackIndex
@@ -559,7 +615,13 @@ internal object DesktopCastManager {
         isConverting = false
         streamOffsetMs = 0L
         convertedDurationMs = 0L
-        worker.execute { mediaServer.stop() }
+        burnedSubtitleKey = null
+        burnNoticeKey = null
+        worker.execute {
+            mediaServer.stop()
+            burnFile?.delete()
+            burnFile = null
+        }
         update { current ->
             current.copy(
                 connectionState = CastConnectionState.Idle,
@@ -585,6 +647,9 @@ internal object DesktopCastManager {
 
     private fun CastSubtitleSelection.sideLoadKey(): Triple<String?, Int, String?> =
         Triple(externalUrl, delayMs, externalLanguage)
+
+    private fun CastSubtitleSelection.burnKey(): Pair<Triple<String?, Int, String?>, CastTextTrackStyle?> =
+        sideLoadKey() to style
 
     internal fun isLocalOnlyHost(url: String): Boolean {
         val host = runCatching { URI(url).host }.getOrNull()?.trim('[', ']') ?: return false

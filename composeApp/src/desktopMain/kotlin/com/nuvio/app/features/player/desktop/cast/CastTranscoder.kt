@@ -15,7 +15,17 @@ internal data class CastTranscodeSpec(
     val audioTrackIndex: Int,
     /** Codec of the first video stream, from [CastTranscoder.probe]; decides the MP4 video tag. */
     val videoCodec: String?,
+    /**
+     * Subtitle file to draw into the picture, already shifted to this stream's timeline.
+     * Burning in means re-encoding the video, so it is only set while a subtitle is enabled.
+     */
+    val burnSubtitlesFile: File? = null,
+    val subtitleStyle: CastTextTrackStyle? = null,
+    /** H.264 encoder for burned-in video, from [CastTranscoder.videoEncoder]. */
+    val videoEncoder: String = SOFTWARE_H264_ENCODER,
 )
+
+internal const val SOFTWARE_H264_ENCODER = "libx264"
 
 internal data class CastMediaProbe(
     val durationMs: Long,
@@ -35,6 +45,9 @@ internal class CastTranscoder(private val extractDir: () -> File) {
 
     @Volatile
     private var resolved: File? = null
+
+    @Volatile
+    private var encoder: String? = null
 
     fun binary(): File? {
         resolved?.takeIf { it.canExecute() }?.let { return it }
@@ -60,7 +73,7 @@ internal class CastTranscoder(private val extractDir: () -> File) {
             add(inputUrl)
         }
         // ffmpeg exits with an error here (no output given) after printing the input summary.
-        return runProcessOutput(command)?.let(::parseProbe)
+        return runProcess(command)?.output?.let(::parseProbe)
     }
 
     /**
@@ -80,10 +93,13 @@ internal class CastTranscoder(private val extractDir: () -> File) {
             add(inputUrl)
             addAll(listOf("-map", "0:v:0", "-c", "copy", "-frames:v", "1", "-copyts", "-start_at_zero", "-f", "framecrc", "-"))
         }
-        return runProcessOutput(command)?.let(::parseFirstPacketMs)
+        return runProcess(command)?.output?.let(::parseFirstPacketMs)
     }
 
-    private fun runProcessOutput(command: List<String>): String? {
+    private class ProcessResult(val exitCode: Int, val output: String)
+
+    /** Runs a short ffmpeg query and collects its combined output; null on timeout. */
+    private fun runProcess(command: List<String>, timeoutSeconds: Long = PROBE_TIMEOUT_SECONDS): ProcessResult? {
         val process = ProcessBuilder(command).redirectErrorStream(true).start()
         val output = StringBuilder()
         val reader = Thread({
@@ -92,18 +108,44 @@ internal class CastTranscoder(private val extractDir: () -> File) {
             isDaemon = true
             start()
         }
-        if (!process.waitFor(PROBE_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+        if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
             process.destroyForcibly()
             return null
         }
         reader.join(1_000)
-        return output.toString()
+        return ProcessResult(process.exitValue(), output.toString())
+    }
+
+    /**
+     * The fastest working H.264 encoder: the GPU's (NVIDIA, Intel, AMD, Apple) when a short test
+     * encode succeeds, otherwise x264. Burning subtitles in has to encode in real time. Blocking.
+     */
+    fun videoEncoder(): String {
+        encoder?.let { return it }
+        val ffmpeg = binary() ?: return SOFTWARE_H264_ENCODER
+        val found = HARDWARE_H264_ENCODERS.firstOrNull { candidate ->
+            val result = runProcess(
+                listOf(
+                    ffmpeg.absolutePath, "-hide_banner", "-nostdin", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "color=black:s=640x360:r=24:d=0.5",
+                    "-vf", "format=yuv420p", "-c:v", candidate, "-f", "null", "-",
+                ),
+                timeoutSeconds = ENCODER_TEST_TIMEOUT_SECONDS,
+            )
+            result != null && result.exitCode == 0
+        } ?: SOFTWARE_H264_ENCODER
+        log.d { "burn-in video encoder: $found" }
+        encoder = found
+        return found
     }
 
     /** Starts converting; the MP4 stream is the process's stdout. */
     fun start(spec: CastTranscodeSpec): Process {
         val ffmpeg = binary() ?: error("ffmpeg is not available")
-        val process = ProcessBuilder(buildArguments(ffmpeg.absolutePath, spec)).start()
+        val process = ProcessBuilder(buildArguments(ffmpeg.absolutePath, spec))
+            // The subtitles filter gets a bare file name: no filtergraph escaping of the path.
+            .apply { spec.burnSubtitlesFile?.parentFile?.let(::directory) }
+            .start()
         // Drain ffmpeg's log so a full stderr pipe can never stall the conversion.
         Thread({
             val tail = ArrayDeque<String>()
@@ -159,6 +201,10 @@ internal class CastTranscoder(private val extractDir: () -> File) {
 
     companion object {
         private const val PROBE_TIMEOUT_SECONDS = 20L
+        private const val ENCODER_TEST_TIMEOUT_SECONDS = 15L
+        private val HARDWARE_H264_ENCODERS = listOf("h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox")
+        /** Converted video is capped at 1080p: enough for the TV, and it keeps encoding real-time. */
+        private const val MAX_BURN_HEIGHT = 1080
 
         private val isWindows: Boolean
             get() = System.getProperty("os.name").orEmpty().lowercase(Locale.ROOT).contains("win")
@@ -204,21 +250,71 @@ internal class CastTranscoder(private val extractDir: () -> File) {
             add(ffmpeg)
             addAll(listOf("-hide_banner", "-nostdin", "-loglevel", "warning"))
             addAll(inputArguments(spec.inputUrl, spec.headers))
+            val burn = spec.burnSubtitlesFile
+            // No -hwaccel: with a GPU driver library missing, ffmpeg aborts instead of falling back.
             if (spec.startMs > 0) {
-                // Before -i: fast keyframe seek, and output timestamps restart at zero.
+                // Before -i: fast seek, and output timestamps restart at zero. Copied video starts
+                // on the previous keyframe; re-encoded video starts exactly at startMs.
                 add("-ss")
                 add(String.format(Locale.ROOT, "%.3f", spec.startMs / 1000.0))
             }
             add("-i")
             add(spec.inputUrl)
             addAll(listOf("-map", "0:v:0", "-map", "0:a:${spec.audioTrackIndex.coerceAtLeast(0)}"))
-            addAll(listOf("-c:v", "copy"))
-            // HEVC in MP4 must be tagged hvc1 for Cast receivers to recognise it.
-            if (spec.videoCodec.equals("hevc", ignoreCase = true)) addAll(listOf("-tag:v", "hvc1"))
+            if (burn != null) {
+                val subtitles = buildString {
+                    append("subtitles=filename=").append(burn.name)
+                    spec.subtitleStyle?.let { append(":force_style='").append(assForceStyle(it)).append('\'') }
+                }
+                add("-vf")
+                add("scale=-2:'min($MAX_BURN_HEIGHT,ih)',format=yuv420p,$subtitles")
+                addAll(listOf("-c:v", spec.videoEncoder))
+                addAll(encoderArguments(spec.videoEncoder))
+                addAll(listOf("-g", "48"))
+            } else {
+                addAll(listOf("-c:v", "copy"))
+                // HEVC in MP4 must be tagged hvc1 for Cast receivers to recognise it.
+                if (spec.videoCodec.equals("hevc", ignoreCase = true)) addAll(listOf("-tag:v", "hvc1"))
+            }
             addAll(listOf("-c:a", "aac", "-ac", "2", "-b:a", "192k"))
             addAll(listOf("-sn", "-dn", "-avoid_negative_ts", "make_zero"))
             addAll(listOf("-f", "mp4", "-movflags", "frag_keyframe+empty_moov+default_base_moof"))
             add("pipe:1")
+        }
+
+        internal fun encoderArguments(encoder: String): List<String> = when (encoder) {
+            "h264_nvenc" -> listOf("-preset", "p4", "-rc", "vbr", "-cq", "21", "-b:v", "0", "-maxrate", "12M", "-bufsize", "24M")
+            "h264_qsv" -> listOf("-preset", "faster", "-global_quality", "21", "-maxrate", "12M", "-bufsize", "24M")
+            "h264_amf" -> listOf("-quality", "speed", "-rc", "vbr_peak", "-b:v", "8M", "-maxrate", "12M")
+            "h264_videotoolbox" -> listOf("-realtime", "1", "-b:v", "8M", "-maxrate", "12M", "-bufsize", "24M")
+            else -> listOf("-preset", "veryfast", "-crf", "21", "-maxrate", "12M", "-bufsize", "24M")
+        } + listOf("-profile:v", "high")
+
+        /** libass style overrides from the player's subtitle style (colours are &HAABBGGRR, AA = transparency). */
+        internal fun assForceStyle(style: CastTextTrackStyle): String = buildList {
+            add("FontSize=${(18 * style.fontScale).toInt().coerceIn(8, 48)}")
+            add("PrimaryColour=${assColour(style.foregroundColor)}")
+            if (style.edgeColor != null) {
+                add("OutlineColour=${assColour(style.edgeColor)}")
+                add("BorderStyle=1")
+                add("Outline=1.5")
+            } else {
+                add("Outline=0")
+                add("Shadow=1")
+            }
+            add("Bold=${if (style.bold) 1 else 0}")
+        }.joinToString(",")
+
+        /** "#RRGGBBAA" (or "#RRGGBB") to ASS "&HAABBGGRR". */
+        internal fun assColour(hex: String): String {
+            val value = hex.removePrefix("#")
+            if (value.length != 6 && value.length != 8) return "&H00FFFFFF"
+            val red = value.substring(0, 2)
+            val green = value.substring(2, 4)
+            val blue = value.substring(4, 6)
+            val alpha = value.substring(6).ifEmpty { "FF" }
+            val transparency = (255 - alpha.toInt(16)).toString(16).padStart(2, '0')
+            return "&H$transparency$blue$green$red".uppercase()
         }
 
         /** First packet's presentation time from framecrc output ("#tb 0: 1/1000" then "0, pts, dts, ..."). */
