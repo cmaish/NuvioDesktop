@@ -67,6 +67,8 @@ jobs:
         run: |
           if [[ -z "${LOCAL_PROPERTIES_BASE64}" ]]; then
             echo "::notice::NUVIO_DESKTOP_LOCAL_PROPERTIES_BASE64 is not set; building without backend keys."
+            # generateRuntimeConfigs declares local.properties as an input file, so it must exist.
+            : > local.properties
             exit 0
           fi
           printf '%s' "${LOCAL_PROPERTIES_BASE64}" | base64 --decode > local.properties
