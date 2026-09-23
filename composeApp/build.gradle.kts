@@ -1366,6 +1366,12 @@ compose.desktop {
                                 </array>
                             </dict>
                         </array>
+                        <key>NSLocalNetworkUsageDescription</key>
+                        <string>Nuvio uses your local network to find Chromecast devices and cast to them.</string>
+                        <key>NSBonjourServices</key>
+                        <array>
+                            <string>_googlecast._tcp</string>
+                        </array>
                     """.trimIndent()
                 }
                 if (macosSigningIdentity != null) {

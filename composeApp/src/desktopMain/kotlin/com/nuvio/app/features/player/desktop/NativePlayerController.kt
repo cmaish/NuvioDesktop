@@ -25,6 +25,12 @@ import com.nuvio.app.features.player.SubtitleStyleState
 import com.nuvio.app.features.player.SubtitleTrack
 import com.nuvio.app.features.player.inferForcedSubtitleTrack
 import com.nuvio.app.features.player.toStorageHexString
+import com.nuvio.app.features.player.desktop.cast.CastConnectionState
+import com.nuvio.app.features.player.desktop.cast.CastMediaSource
+import com.nuvio.app.features.player.desktop.cast.CastPlayerState
+import com.nuvio.app.features.player.desktop.cast.CastSubtitleSelection
+import com.nuvio.app.features.player.desktop.cast.CastTextTrackStyle
+import com.nuvio.app.features.player.desktop.cast.DesktopCastManager
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
@@ -34,6 +40,7 @@ import java.awt.event.WindowEvent
 import java.util.concurrent.CountDownLatch
 import javax.swing.SwingUtilities
 import kotlin.concurrent.Volatile
+import kotlin.math.roundToInt
 
 internal typealias NativePlayerCreate = (
     Long,
@@ -107,6 +114,19 @@ internal class NativePlayerController(
     private var onEvent: (String, Double) -> Boolean = { _, _ -> false }
     private var onScrubChange: (Long) -> Boolean = { false }
     private var onScrubFinished: (Long) -> Boolean = { false }
+    // Chromecast: what the local player shows, mirrored onto the receiver while casting.
+    @Volatile
+    private var castOwner = false
+    private var castListenerInstalled = false
+    private var castSourceUrl: String? = null
+    private var castSessionToken = 0L
+    private var castSubtitleUrl: String? = null
+    private var castEmbeddedSubtitleIndex = -1
+    private val castListener: () -> Unit = { SwingUtilities.invokeLater { refreshCastControls() } }
+
+    private val isCasting: Boolean
+        get() = castOwner && DesktopCastManager.isCasting
+
     private val eventSink = NativePlayerEventSink { type, value ->
         SwingUtilities.invokeLater {
             handlePlayerEvent(type, value)
@@ -122,10 +142,11 @@ internal class NativePlayerController(
         nvidiaRtxSuperResolutionEnabled: Boolean,
         onError: (String?) -> Unit,
     ) {
+        val casting = isCasting
         val pending = PendingSource(
             sourceUrl = sourceUrl,
             headerLines = sourceHeaders.toHeaderLines(),
-            playWhenReady = playWhenReady,
+            playWhenReady = playWhenReady && !casting,
             initialPositionMs = initialPositionMs.coerceAtLeast(0L),
             decoderPriority = decoderPriority,
             nvidiaRtxSuperResolutionEnabled = nvidiaRtxSuperResolutionEnabled,
@@ -148,6 +169,15 @@ internal class NativePlayerController(
         if (!accepted) {
             terminalFailure?.let { message -> SwingUtilities.invokeLater { pending.onError(message) } }
             return
+        }
+        if (castSourceUrl != sourceUrl) {
+            // A new source starts without side-loaded subtitles; the screen re-applies them.
+            castSubtitleUrl = null
+            castEmbeddedSubtitleIndex = -1
+            if (casting) {
+                DesktopCastManager.changeMedia(castMediaFor(pending), castSubtitleSelection(), pending.initialPositionMs)
+            }
+            castSourceUrl = sourceUrl
         }
         log.d {
             "attach requested source=${sourceUrl.toPlaybackLogKey()} headers=${sourceHeaders.size} " +
@@ -338,6 +368,7 @@ internal class NativePlayerController(
                                 "initialPositionMs=${pending.initialPositionMs}"
                         }
                         applyRememberedVolume()
+                        if (isCasting) NativePlayerBridge.setPaused(created, true)
                         updateControls(controlsState)
                         setResizeMode(rememberedResizeMode)
                         applyPendingSubtitleSettings()
@@ -428,10 +459,12 @@ internal class NativePlayerController(
         currentVolumeLevel = stateWithVolume.volumeLevel ?: currentVolumeLevel
         controlsState = stateWithVolume
         val isFullscreen = isDesktopAppFullscreen(SwingUtilities.getWindowAncestor(host))
+        val cast = castControlsSnapshot()
         val structureKey = NativeControlsStructureKey(
             state = stateWithVolume.nativeControlsStructureKey(),
             isFullscreen = isFullscreen,
             isInPip = DesktopPlayerPictureInPicture.isEnabled,
+            cast = cast,
         )
         if (structureKey == lastSentControlsStructureKey) return
         lastSentControlsStructureKey = structureKey
@@ -441,7 +474,7 @@ internal class NativePlayerController(
                 "speed=${stateWithVolume.playbackSpeedLabel} audioLabel=${stateWithVolume.audioLabel} " +
                 "subsLabel=${stateWithVolume.subtitlesLabel} fullscreen=$isFullscreen"
         }
-        NativePlayerBridge.updateControls(current, stateWithVolume.toControlsJson(isFullscreen))
+        NativePlayerBridge.updateControls(current, stateWithVolume.toControlsJson(isFullscreen, cast))
     }
 
     fun onDesktopFullscreenChanged() {
@@ -512,6 +545,21 @@ internal class NativePlayerController(
                 }
             }
             "dragWindow" -> NativePlayerBridge.beginWindowDrag(handle)
+            "castOpen" -> {
+                installCastListener()
+                DesktopCastManager.startDiscovery()
+                refreshCastControls()
+            }
+            "castSelectDevice" -> startCasting(value.toInt())
+            "castStop" -> if (castOwner) DesktopCastManager.stopCasting()
+            "cast:setPlaybackState",
+            "cast:setPlaybackStateQuiet" -> {
+                // The controls page renames play/pause while casting so the native bridge does not
+                // resume the local player. Keep the screen's play state in sync, and drive the
+                // receiver directly: the screen only reacts when its own state actually changes.
+                onEvent(type.removePrefix("cast:"), value)
+                if (value >= 0.5) play() else pause()
+            }
             "volumeChange" -> setFallbackVolume(value.toFloat())
             "volumeChangeTemporary" -> setTemporaryVolume(value.toFloat())
             "setPlaybackSpeed" -> {
@@ -546,6 +594,10 @@ internal class NativePlayerController(
         when (action) {
             PlayerControlsAction.TogglePlayback,
             PlayerControlsAction.KeyboardTogglePlayback -> {
+                if (isCasting) {
+                    if (DesktopCastManager.currentStatus()?.playerState == CastPlayerState.Playing) pause() else play()
+                    return
+                }
                 val current = handle
                 if (current == 0L) return
                 val isEnded = NativePlayerBridge.isEnded(current)
@@ -589,6 +641,10 @@ internal class NativePlayerController(
 
     @Synchronized
     private fun setFallbackVolume(level: Float) {
+        if (isCasting) {
+            setCastVolume(level)
+            return
+        }
         val current = handle
         if (current != 0L) {
             val nextLevel = level.coerceDesktopPlayerVolumeLevel()
@@ -603,6 +659,10 @@ internal class NativePlayerController(
 
     @Synchronized
     private fun setTemporaryVolume(level: Float) {
+        if (isCasting) {
+            setCastVolume(level)
+            return
+        }
         val current = handle
         if (current != 0L) {
             val nextLevel = level.coerceDesktopPlayerVolumeLevel()
@@ -624,7 +684,19 @@ internal class NativePlayerController(
         log.d { "applied remembered volume level=$level handle=$current" }
     }
 
+    private fun setCastVolume(level: Float) {
+        val nextLevel = level.coerceIn(0f, 1f)
+        DesktopCastManager.setVolume(nextLevel)
+        controlsState = controlsState.copy(volumeLevel = nextLevel)
+        currentVolumeLevel = nextLevel
+        updateControls(controlsState)
+    }
+
     private fun fallbackSeekBy(offsetMs: Long) {
+        if (isCasting) {
+            DesktopCastManager.seekBy(offsetMs)
+            return
+        }
         val current = handle
         if (current != 0L) {
             NativePlayerBridge.seekBy(current, offsetMs)
@@ -641,6 +713,7 @@ internal class NativePlayerController(
     }
 
     fun snapshot(): PlayerPlaybackSnapshot {
+        if (isCasting) return castSnapshot()
         val current = handle
         if (current == 0L) return PlayerPlaybackSnapshot(isLoading = true)
         return runCatching {
@@ -670,6 +743,7 @@ internal class NativePlayerController(
             releaseRequested = true
         }
         host.resetCursorVisibility()
+        releaseCasting()
         invalidateForRelease()
         val callback = ReleaseCallback(onReleased, onReleaseFailed)
         var shouldStart = false
@@ -893,21 +967,38 @@ internal class NativePlayerController(
     }
 
     override fun play() {
-        log.d { "play handle=$handle" }
+        log.d { "play handle=$handle casting=$isCasting" }
+        if (isCasting) {
+            handle.takeIf { it != 0L }?.let { NativePlayerBridge.setPaused(it, true) }
+            DesktopCastManager.play()
+            return
+        }
         handle.takeIf { it != 0L }?.let { NativePlayerBridge.setPaused(it, false) }
     }
 
     override fun pause() {
-        log.d { "pause handle=$handle" }
+        log.d { "pause handle=$handle casting=$isCasting" }
+        if (isCasting) {
+            DesktopCastManager.pause()
+            return
+        }
         handle.takeIf { it != 0L }?.let { NativePlayerBridge.setPaused(it, true) }
     }
 
     override fun seekTo(positionMs: Long) {
-        log.d { "seekTo positionMs=$positionMs handle=$handle" }
+        log.d { "seekTo positionMs=$positionMs handle=$handle casting=$isCasting" }
+        if (isCasting) {
+            DesktopCastManager.seekTo(positionMs)
+            return
+        }
         handle.takeIf { it != 0L }?.let { nativeSeekTo(it, positionMs) }
     }
 
     override fun trySeekTo(positionMs: Long): Boolean {
+        if (isCasting) {
+            DesktopCastManager.seekTo(positionMs)
+            return true
+        }
         val current = handle.takeIf { it != 0L } ?: return false
         log.d { "trySeekTo positionMs=$positionMs handle=$current" }
         nativeSeekTo(current, positionMs)
@@ -915,7 +1006,11 @@ internal class NativePlayerController(
     }
 
     override fun seekBy(offsetMs: Long) {
-        log.d { "seekBy offsetMs=$offsetMs handle=$handle" }
+        log.d { "seekBy offsetMs=$offsetMs handle=$handle casting=$isCasting" }
+        if (isCasting) {
+            DesktopCastManager.seekBy(offsetMs)
+            return
+        }
         handle.takeIf { it != 0L }?.let { NativePlayerBridge.seekBy(it, offsetMs) }
     }
 
@@ -934,6 +1029,7 @@ internal class NativePlayerController(
 
     override fun setPlaybackSpeed(speed: Float) {
         log.d { "setPlaybackSpeed speed=$speed handle=$handle" }
+        if (isCasting) DesktopCastManager.setPlaybackRate(speed)
         handle.takeIf { it != 0L }?.let { NativePlayerBridge.setSpeed(it, speed) }
     }
 
@@ -995,6 +1091,7 @@ internal class NativePlayerController(
     }
 
     override fun selectSubtitleTrack(index: Int) {
+        trackCastSubtitle(externalUrl = null, embeddedIndex = index)
         val current = handle.takeIf { it != 0L } ?: return
         if (index < 0) {
             log.d { "selectSubtitleTrack off handle=$current" }
@@ -1013,6 +1110,7 @@ internal class NativePlayerController(
 
     override fun setSubtitleUri(url: String) {
         log.d { "setSubtitleUri ${url.toPlaybackLogKey()} handle=$handle" }
+        trackCastSubtitle(externalUrl = url, embeddedIndex = -1)
         handle.takeIf { it != 0L }?.let { current ->
             NativePlayerBridge.clearExternalSubtitles(current)
             NativePlayerBridge.addSubtitleUrl(current, url)
@@ -1021,10 +1119,12 @@ internal class NativePlayerController(
 
     override fun clearExternalSubtitle() {
         log.d { "clearExternalSubtitle handle=$handle" }
+        trackCastSubtitle(externalUrl = null, embeddedIndex = -1)
         handle.takeIf { it != 0L }?.let(NativePlayerBridge::clearExternalSubtitles)
     }
 
     override fun clearExternalSubtitleAndSelect(trackIndex: Int) {
+        trackCastSubtitle(externalUrl = null, embeddedIndex = trackIndex)
         val current = handle.takeIf { it != 0L } ?: return
         val trackId = if (trackIndex < 0) {
             -1
@@ -1043,6 +1143,7 @@ internal class NativePlayerController(
     override fun setSubtitleDelayMs(delayMs: Int) {
         val clamped = delayMs.coerceIn(SUBTITLE_DELAY_MIN_MS, SUBTITLE_DELAY_MAX_MS)
         pendingSubtitleDelayMs = clamped
+        if (isCasting) DesktopCastManager.updateSubtitles(castSubtitleSelection())
         handle.takeIf { it != 0L }?.let { current ->
             NativePlayerBridge.setSubtitleDelayMs(current, clamped)
         }
@@ -1051,6 +1152,7 @@ internal class NativePlayerController(
     override fun applySubtitleStyle(style: SubtitleStyleState, useLibass: Boolean) {
         pendingSubtitleStyle = style
         pendingUseLibass = useLibass
+        if (isCasting) DesktopCastManager.updateSubtitles(castSubtitleSelection())
         handle.takeIf { it != 0L }?.let { current ->
             applySubtitleStyle(current, style, useLibass)
         }
@@ -1078,6 +1180,167 @@ internal class NativePlayerController(
             subPos = style.toMpvSubtitlePosition(),
             useLibass = useLibass,
             stripSdh = style.stripSdh,
+        )
+    }
+
+    private fun installCastListener() {
+        if (castListenerInstalled) return
+        castListenerInstalled = true
+        DesktopCastManager.addListener(castListener)
+    }
+
+    private fun refreshCastControls() {
+        if (releaseRequested) return
+        lastSentControlsStructureKey = null
+        updateControls(controlsState)
+    }
+
+    private fun startCasting(deviceIndex: Int) {
+        val device = DesktopCastManager.state.devices.getOrNull(deviceIndex) ?: return
+        val pending = pendingSource ?: return
+        if (isCasting && DesktopCastManager.state.activeDevice?.id == device.id) return
+        installCastListener()
+        val current = handle
+        // Switching devices mid-cast continues from the receiver, not the paused local player.
+        val castStatus = if (isCasting) DesktopCastManager.currentStatus() else null
+        val positionMs = when {
+            castStatus != null -> castStatus.positionMs
+            current != 0L -> runCatching { NativePlayerBridge.positionMs(current) }.getOrDefault(pending.initialPositionMs)
+            else -> pending.initialPositionMs
+        }
+        val paused = if (castStatus != null) {
+            castStatus.playerState == CastPlayerState.Paused
+        } else {
+            current != 0L && runCatching {
+                NativePlayerBridge.isPaused(current) && !NativePlayerBridge.isLoading(current)
+            }.getOrDefault(false)
+        }
+        log.d { "startCasting device=${device.name} positionMs=$positionMs paused=$paused" }
+        val token = ++castSessionToken
+        castOwner = true
+        castSourceUrl = pending.sourceUrl
+        if (current != 0L) NativePlayerBridge.setPaused(current, true)
+        DesktopCastManager.connect(
+            device = device,
+            media = castMediaFor(pending),
+            subtitles = castSubtitleSelection(),
+            positionMs = positionMs,
+            autoplay = !paused,
+            onEnded = { endedAtMs, wasPlaying, _ ->
+                SwingUtilities.invokeLater { onCastEnded(token, endedAtMs, wasPlaying) }
+            },
+        )
+        refreshCastControls()
+    }
+
+    /** Casting finished (stopped by the user, the TV, or a failure): continue locally. */
+    private fun onCastEnded(token: Long, positionMs: Long, wasPlaying: Boolean) {
+        // A session replaced by a newer one (device switch) must not hand playback back.
+        if (!castOwner || token != castSessionToken) return
+        castOwner = false
+        log.d { "cast ended positionMs=$positionMs wasPlaying=$wasPlaying handle=$handle" }
+        if (releaseRequested) return
+        handle.takeIf { it != 0L }?.let { current ->
+            if (positionMs > 0L) nativeSeekTo(current, positionMs)
+            NativePlayerBridge.setPaused(current, !wasPlaying)
+        }
+        onEvent("setPlaybackStateQuiet", if (wasPlaying) 1.0 else 0.0)
+        refreshCastControls()
+    }
+
+    private fun releaseCasting() {
+        if (castListenerInstalled) {
+            castListenerInstalled = false
+            DesktopCastManager.removeListener(castListener)
+        }
+        if (castOwner) {
+            castOwner = false
+            DesktopCastManager.stopCasting()
+        }
+    }
+
+    private fun trackCastSubtitle(externalUrl: String?, embeddedIndex: Int) {
+        castSubtitleUrl = externalUrl
+        castEmbeddedSubtitleIndex = if (externalUrl == null) embeddedIndex else -1
+        if (isCasting) DesktopCastManager.updateSubtitles(castSubtitleSelection())
+    }
+
+    private fun castMediaFor(pending: PendingSource): CastMediaSource {
+        val state = controlsState
+        return CastMediaSource(
+            url = pending.sourceUrl,
+            headers = pending.headerLines.toHeaderMap(),
+            title = state.title.ifBlank { state.streamTitle },
+            subtitle = listOf(state.episodeText, state.pauseOverlayEpisodeTitle)
+                .filter(String::isNotBlank)
+                .joinToString(" • "),
+            imageUrl = state.openingArtwork?.takeIf(String::isNotBlank) ?: state.pauseOverlayLogo,
+        )
+    }
+
+    private fun castSubtitleSelection(): CastSubtitleSelection {
+        val addon = controlsState.addonSubtitleItems.firstOrNull { it.isSelected }
+        val embedded = castEmbeddedSubtitleIndex.takeIf { it >= 0 }?.let { index ->
+            runCatching { getSubtitleTracks() }.getOrDefault(emptyList()).firstOrNull { it.index == index }
+        }
+        return CastSubtitleSelection(
+            externalUrl = castSubtitleUrl,
+            externalName = addon?.let { it.languageLabel.ifBlank { it.display } },
+            externalLanguage = addon?.language?.takeIf(String::isNotBlank),
+            embeddedLanguage = embedded?.language,
+            embeddedName = embedded?.label,
+            delayMs = pendingSubtitleDelayMs ?: 0,
+            style = pendingSubtitleStyle?.toCastTextTrackStyle(),
+        )
+    }
+
+    private fun castSnapshot(): PlayerPlaybackSnapshot {
+        val status = DesktopCastManager.currentStatus() ?: return PlayerPlaybackSnapshot(isLoading = true)
+        val connecting = DesktopCastManager.state.connectionState == CastConnectionState.Connecting
+        return PlayerPlaybackSnapshot(
+            isLoading = connecting ||
+                status.playerState == CastPlayerState.Loading ||
+                status.playerState == CastPlayerState.Buffering,
+            isPlaying = status.playerState == CastPlayerState.Playing,
+            isEnded = status.isEnded,
+            durationMs = status.durationMs,
+            positionMs = status.positionMs,
+            bufferedPositionMs = status.positionMs,
+            playbackSpeed = status.playbackRate,
+        )
+    }
+
+    private fun castControlsSnapshot(): CastControlsSnapshot {
+        if (!castListenerInstalled && !castOwner) return CastControlsSnapshot()
+        val ui = DesktopCastManager.state
+        val owner = castOwner && ui.connectionState != CastConnectionState.Idle
+        val status = if (owner) DesktopCastManager.currentStatus() else null
+        return CastControlsSnapshot(
+            state = when {
+                !owner -> "idle"
+                ui.connectionState == CastConnectionState.Connected -> "connected"
+                else -> "connecting"
+            },
+            deviceName = if (owner) ui.activeDevice?.name.orEmpty() else "",
+            discovering = ui.isDiscovering,
+            devices = ui.devices.mapIndexed { index, device ->
+                CastControlsDevice(
+                    index = index,
+                    name = device.name,
+                    model = device.model,
+                    isActive = owner && device.id == ui.activeDevice?.id,
+                )
+            },
+            positionMs = status?.positionMs ?: 0L,
+            durationMs = status?.durationMs ?: 0L,
+            isPlaying = status?.playerState == CastPlayerState.Playing,
+            isLoading = owner && (
+                ui.connectionState == CastConnectionState.Connecting ||
+                    status?.playerState == CastPlayerState.Loading ||
+                    status?.playerState == CastPlayerState.Buffering
+                ),
+            errorMessage = ui.errorMessage.orEmpty(),
+            errorToken = ui.errorToken,
         )
     }
 
@@ -1213,11 +1476,96 @@ private data class NativeControlsStructureKey(
     val state: PlayerControlsState,
     val isFullscreen: Boolean,
     val isInPip: Boolean,
+    val cast: CastControlsSnapshot,
 )
 
-private fun PlayerControlsState.toControlsJson(isFullscreen: Boolean): String =
+private data class CastControlsDevice(
+    val index: Int,
+    val name: String,
+    val model: String,
+    val isActive: Boolean,
+)
+
+private data class CastControlsSnapshot(
+    val state: String = "idle",
+    val deviceName: String = "",
+    val discovering: Boolean = false,
+    val devices: List<CastControlsDevice> = emptyList(),
+    val positionMs: Long = 0L,
+    val durationMs: Long = 0L,
+    val isPlaying: Boolean = false,
+    val isLoading: Boolean = false,
+    val errorMessage: String = "",
+    val errorToken: Long = 0L,
+)
+
+private fun SubtitleStyleState.toCastTextTrackStyle(): CastTextTrackStyle =
+    CastTextTrackStyle(
+        foregroundColor = textColor.toCastColorString(),
+        edgeColor = if (outlineEnabled) outlineColor.toCastColorString() else null,
+        // The receiver's 1.0 scale roughly matches the player's default 18sp subtitles.
+        fontScale = (fontSizeSp / 18f).coerceIn(0.5f, 2.5f),
+        bold = bold,
+    )
+
+private fun Color.toCastColorString(): String {
+    fun channel(value: Float) = (value.coerceIn(0f, 1f) * 255f).roundToInt().toHexByte()
+    return "#${channel(red)}${channel(green)}${channel(blue)}${channel(alpha)}"
+}
+
+private fun StringBuilder.appendCastJson(cast: CastControlsSnapshot) {
+    appendJsonField("castState", cast.state)
+    append(',')
+    appendJsonField("castDeviceName", cast.deviceName)
+    append(',')
+    appendJsonField("castDiscovering", cast.discovering)
+    append(',')
+    appendJsonArrayField("castDevices", cast.devices) { device ->
+        append('{')
+        appendJsonField("index", device.index)
+        append(',')
+        appendJsonField("name", device.name)
+        append(',')
+        appendJsonField("model", device.model)
+        append(',')
+        appendJsonField("isActive", device.isActive)
+        append('}')
+    }
+    append(',')
+    appendJsonField("castPositionMs", cast.positionMs)
+    append(',')
+    appendJsonField("castDurationMs", cast.durationMs)
+    append(',')
+    appendJsonField("castIsPlaying", cast.isPlaying)
+    append(',')
+    appendJsonField("castIsLoading", cast.isLoading)
+    append(',')
+    appendJsonField("castErrorMessage", cast.errorMessage)
+    append(',')
+    appendJsonField("castErrorToken", cast.errorToken)
+}
+
+private fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, cast: CastControlsSnapshot): String =
     buildString {
         append('{')
+        appendCastJson(cast)
+        append(',')
+        appendJsonField("castLabel", castLabel)
+        append(',')
+        appendJsonField("castPanelTitle", castPanelTitle)
+        append(',')
+        appendJsonField("castSearchingLabel", castSearchingLabel)
+        append(',')
+        appendJsonField("castNoDevicesLabel", castNoDevicesLabel)
+        append(',')
+        appendJsonField("castConnectingLabel", castConnectingLabel)
+        append(',')
+        appendJsonField("castConnectedLabel", castConnectedLabel)
+        append(',')
+        appendJsonField("castStopLabel", castStopLabel)
+        append(',')
+        appendJsonField("castRefreshLabel", castRefreshLabel)
+        append(',')
         appendJsonField("title", title)
         append(',')
         appendJsonField("episodeText", episodeText)

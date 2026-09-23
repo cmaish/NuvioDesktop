@@ -352,6 +352,14 @@
     <string name="compose_player_pip_placeholder_title">Video playing in Picture-in-Picture</string>
     <string name="compose_player_pip_restore">Restore to Main Player</string>
     <string name="compose_player_pip_window_title">Nuvio • Picture-in-Picture</string>
+    <string name="compose_player_cast">Cast</string>
+    <string name="compose_player_cast_panel_title">Cast to device</string>
+    <string name="compose_player_cast_searching">Searching for devices…</string>
+    <string name="compose_player_cast_no_devices">No Cast devices found on this network</string>
+    <string name="compose_player_cast_connecting">Connecting to %1$s…</string>
+    <string name="compose_player_cast_connected">Casting to %1$s</string>
+    <string name="compose_player_cast_stop">Stop casting</string>
+    <string name="compose_player_cast_refresh">Refresh</string>
     <string name="compose_auth_already_have_account">Already have an account? </string>
     <string name="compose_auth_continue_without_account">Continue Without Account</string>
     <string name="compose_auth_create_account">Create Account</string>
