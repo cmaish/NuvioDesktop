@@ -104,6 +104,49 @@ class CastMediaServerTest {
     }
 
     @Test
+    fun `extensionless streams are identified from headers and magic bytes`() {
+        assertEquals(null, CastMediaServer.contentTypeFromExtension("https://debrid.example/dl/ABC123"))
+        assertEquals("video/x-matroska", CastMediaServer.contentTypeFromHeader("video/x-matroska"))
+        assertEquals("application/x-mpegurl", CastMediaServer.contentTypeFromHeader("application/vnd.apple.mpegurl"))
+        assertEquals(null, CastMediaServer.contentTypeFromHeader("application/octet-stream"))
+        assertEquals(
+            "video/x-matroska",
+            CastMediaServer.sniffContentType(byteArrayOf(0x1A, 0x45, 0xDF.toByte(), 0xA3.toByte(), 1, 0, 0, 0)),
+        )
+        assertEquals("video/mp4", CastMediaServer.sniffContentType(byteArrayOf(0, 0, 0, 0x20) + "ftypisom".encodeToByteArray()))
+        assertEquals("application/x-mpegurl", CastMediaServer.sniffContentType("#EXTM3U\n#EXT".encodeToByteArray()))
+        assertEquals(null, CastMediaServer.sniffContentType("<html>".encodeToByteArray()))
+    }
+
+    @Test
+    fun `octet stream links are probed for their container`() {
+        upstream = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
+            createContext("/dl/abc") { exchange ->
+                val body = byteArrayOf(0x1A, 0x45, 0xDF.toByte(), 0xA3.toByte()) + ByteArray(12)
+                exchange.responseHeaders.add("Content-Type", "application/octet-stream")
+                exchange.sendResponseHeaders(206, body.size.toLong())
+                exchange.responseBody.use { it.write(body) }
+            }
+            start()
+        }
+
+        val type = server.probeContentType("http://127.0.0.1:${upstream!!.address.port}/dl/abc", emptyMap())
+
+        assertEquals("video/x-matroska", type)
+    }
+
+    @Test
+    fun `subtitle fetches are recorded`() {
+        server.start()
+        val url = server.publishSubtitle("127.0.0.1", "WEBVTT\n\n")
+        assertEquals(false, server.wasSubtitleFetched(url))
+
+        (URI(url.toLoopback()).toURL().openConnection() as HttpURLConnection).inputStream.use { it.readBytes() }
+
+        assertEquals(true, server.wasSubtitleFetched(url))
+    }
+
+    @Test
     fun `served subtitles carry CORS headers`() {
         server.start()
         val url = server.publishSubtitle("127.0.0.1", "WEBVTT\n\n").toLoopback()

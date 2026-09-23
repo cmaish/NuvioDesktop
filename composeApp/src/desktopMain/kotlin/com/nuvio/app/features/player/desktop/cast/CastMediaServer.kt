@@ -37,6 +37,7 @@ internal class CastMediaServer {
     private val subtitles = ConcurrentHashMap<String, String>()
     private val files = ConcurrentHashMap<String, File>()
     private val proxyScopes = ConcurrentHashMap<String, Map<String, String>>()
+    private val fetchedSubtitles = ConcurrentHashMap.newKeySet<String>()
     private var server: HttpServer? = null
     private var executor: ExecutorService? = null
     private val httpClient: OkHttpClient by lazy {
@@ -79,6 +80,7 @@ internal class CastMediaServer {
         executor?.shutdownNow()
         executor = null
         subtitles.clear()
+        fetchedSubtitles.clear()
         files.clear()
         proxyScopes.clear()
     }
@@ -109,6 +111,31 @@ internal class CastMediaServer {
         val token = newToken()
         proxyScopes[token] = headers
         return proxyUrl(baseUrlFor(receiverHost), token, url)
+    }
+
+    /** Whether the receiver has requested the subtitle published at [url] yet. */
+    fun wasSubtitleFetched(url: String): Boolean =
+        url.substringAfterLast("/s/").substringBefore('.') in fetchedSubtitles
+
+    /**
+     * Works out a content type for [url] when its path has no telling extension (debrid and
+     * addon links rarely do): the server's Content-Type when it names a media type, otherwise
+     * the container's magic bytes.
+     */
+    fun probeContentType(url: String, headers: Map<String, String>): String? {
+        val request = Request.Builder()
+            .url(url)
+            .apply {
+                headers.forEach { (name, value) -> header(name, value) }
+                header("Range", "bytes=0-15")
+            }
+            .build()
+        return httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) return@use null
+            val declared = response.header("Content-Type")?.substringBefore(';')?.trim()?.lowercase()
+            val head = response.body?.byteStream()?.use { it.readNBytes(16) } ?: ByteArray(0)
+            contentTypeFromHeader(declared) ?: sniffContentType(head)
+        }
     }
 
     private fun proxyUrl(base: String, token: String, url: String): String {
@@ -150,6 +177,7 @@ internal class CastMediaServer {
             return
         }
         exchange.responseHeaders.add("Content-Type", "text/vtt; charset=utf-8")
+        fetchedSubtitles += token
         if (exchange.requestMethod.equals("HEAD", ignoreCase = true)) {
             exchange.responseHeaders.add("Content-Length", body.size.toString())
             exchange.sendResponseHeaders(200, -1)
@@ -308,7 +336,30 @@ internal class CastMediaServer {
             }
         }
 
-        internal fun guessContentType(nameOrUrl: String): String {
+        internal fun guessContentType(nameOrUrl: String): String = contentTypeFromExtension(nameOrUrl) ?: "video/mp4"
+
+        internal fun contentTypeFromHeader(declared: String?): String? {
+            val type = declared?.lowercase() ?: return null
+            return when {
+                type.contains("mpegurl") -> "application/x-mpegurl"
+                type == "application/dash+xml" -> type
+                type.startsWith("video/") || type.startsWith("audio/") -> type
+                else -> null
+            }
+        }
+
+        internal fun sniffContentType(head: ByteArray): String? {
+            fun at(offset: Int, vararg bytes: Int) =
+                head.size >= offset + bytes.size && bytes.indices.all { (head[offset + it].toInt() and 0xFF) == bytes[it] }
+            return when {
+                at(0, 0x1A, 0x45, 0xDF, 0xA3) -> "video/x-matroska"
+                at(4, 'f'.code, 't'.code, 'y'.code, 'p'.code) -> "video/mp4"
+                at(0, '#'.code, 'E'.code, 'X'.code, 'T'.code, 'M'.code, '3'.code, 'U'.code) -> "application/x-mpegurl"
+                else -> null
+            }
+        }
+
+        internal fun contentTypeFromExtension(nameOrUrl: String): String? {
             val path = nameOrUrl.substringBefore('?').substringBefore('#').lowercase()
             return when {
                 path.endsWith(".m3u8") -> "application/x-mpegurl"
@@ -320,7 +371,8 @@ internal class CastMediaServer {
                 path.endsWith(".mov") -> "video/quicktime"
                 path.endsWith(".mp3") -> "audio/mpeg"
                 path.endsWith(".m4a") || path.endsWith(".aac") -> "audio/mp4"
-                else -> "video/mp4"
+                path.endsWith(".mp4") || path.endsWith(".m4v") -> "video/mp4"
+                else -> null
             }
         }
 

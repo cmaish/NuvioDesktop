@@ -8,6 +8,7 @@ import java.net.InetAddress
 import java.net.URI
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.Volatile
 
@@ -18,6 +19,10 @@ internal data class CastMediaSource(
     val title: String,
     val subtitle: String,
     val imageUrl: String?,
+    /** Label of the audio track playing locally (mpv includes the codec, e.g. "English · 5.1 · DTS"). */
+    val audioTrackLabel: String? = null,
+    /** Position of that track among the stream's audio tracks. */
+    val audioTrackIndex: Int = 0,
 )
 
 /** The subtitle the local player shows, mirrored onto the receiver. */
@@ -59,6 +64,9 @@ internal object DesktopCastManager {
     private val worker: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "nuvio-cast-worker").apply { isDaemon = true }
     }
+    private val timer: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "nuvio-cast-timer").apply { isDaemon = true }
+    }
     private val listeners = mutableSetOf<() -> Unit>()
     private val mediaServer = CastMediaServer()
     private val httpClient: OkHttpClient by lazy {
@@ -81,6 +89,10 @@ internal object DesktopCastManager {
     @Volatile private var loadedSubtitleKey: Triple<String?, Int, String?>? = null
     @Volatile private var hasSideLoadedTrack = false
     @Volatile private var pendingEmbeddedMatch = false
+    @Volatile private var pendingAudioTrackIndex = 0
+    @Volatile private var audioWarningKey: String? = null
+    /** Bumped on every LOAD so delayed checks can tell the media they were scheduled for is gone. */
+    @Volatile private var loadGeneration = 0L
     @Volatile private var sessionEndedListener: ((positionMs: Long, wasPlaying: Boolean, reason: String?) -> Unit)? = null
 
     val isCasting: Boolean
@@ -164,6 +176,12 @@ internal object DesktopCastManager {
                     return@execute
                 }
                 update { it.copy(connectionState = CastConnectionState.Connected) }
+                // Subtitle changes made while connecting were not applied yet.
+                val latest = currentSubtitles
+                if (latest != subtitles) {
+                    currentSubtitles = subtitles
+                    updateSubtitles(latest)
+                }
             } catch (error: Throwable) {
                 log.w(error) { "casting to ${device.name} failed" }
                 created.stop()
@@ -216,6 +234,29 @@ internal object DesktopCastManager {
         }
     }
 
+    /**
+     * Mirrors a local audio track change. Only possible when the receiver itself lists the
+     * stream's audio tracks (MP4, HLS, DASH); progressive MKV plays its default track.
+     */
+    fun selectAudioTrack(index: Int, label: String?) {
+        val media = currentMedia ?: return
+        if (media.audioTrackIndex == index) return
+        currentMedia = media.copy(audioTrackIndex = index, audioTrackLabel = label)
+        withSession { active ->
+            val status = active.status()
+            val track = status.receiverAudioTracks.getOrNull(index)
+            val stillLoading = status.playerState == CastPlayerState.Loading || status.durationMs <= 0L
+            when {
+                track != null -> {
+                    active.setActiveAudioTrack(track.id)
+                    unsupportedAudioWarning(label, active.device.name)?.let(::reportError)
+                }
+                status.receiverAudioTracks.isEmpty() && stillLoading -> pendingAudioTrackIndex = index
+                else -> reportError("${active.device.name} can't switch audio tracks for this stream.")
+            }
+        }
+    }
+
     fun play() = withSession { it.play() }
 
     fun pause() = withSession { it.pause() }
@@ -263,9 +304,13 @@ internal object DesktopCastManager {
     ) {
         val host = active.device.host
         val contentUrl = resolveContentUrl(host, media)
+        val contentType = resolveContentType(media)
         val sideLoaded = subtitles.externalUrl?.let { url ->
-            runCatching { loadSubtitleVtt(url, subtitles.delayMs) }
-                .onFailure { error -> log.w(error) { "could not prepare subtitle for cast" } }
+            runCatching { loadSubtitleVtt(url, subtitles.delayMs) ?: error("No subtitle lines could be read") }
+                .onFailure { error ->
+                    log.w(error) { "could not prepare subtitle for cast" }
+                    reportError("Couldn't load the selected subtitles for casting.")
+                }
                 .getOrNull()
                 ?.let { vtt ->
                     CastTextTrack(
@@ -278,11 +323,14 @@ internal object DesktopCastManager {
         }
         hasSideLoadedTrack = sideLoaded != null
         loadedSubtitleKey = if (sideLoaded != null) subtitles.sideLoadKey() else null
-        pendingEmbeddedMatch = sideLoaded == null && !subtitles.isOff
+        pendingEmbeddedMatch = sideLoaded == null && subtitles.externalUrl == null && !subtitles.isOff
+        pendingAudioTrackIndex = media.audioTrackIndex
+        val thisLoad = ++loadGeneration
+        log.d { "cast load contentType=$contentType subtitles=${sideLoaded != null} audio=${media.audioTrackLabel}" }
         active.load(
             CastLoadRequest(
                 contentUrl = contentUrl,
-                contentType = CastMediaServer.guessContentType(media.url),
+                contentType = contentType,
                 title = media.title,
                 subtitle = media.subtitle,
                 imageUrl = media.imageUrl?.takeIf { it.startsWith("http", ignoreCase = true) },
@@ -293,6 +341,41 @@ internal object DesktopCastManager {
                 textTrackStyle = subtitles.style,
             ),
         )
+        val warningKey = "${media.url}|${media.audioTrackLabel}"
+        if (warningKey != audioWarningKey) {
+            audioWarningKey = warningKey
+            unsupportedAudioWarning(media.audioTrackLabel, active.device.name)?.let(::reportError)
+        }
+        if (sideLoaded != null) {
+            // The receiver fetches an active text track right after loading. If it never asks,
+            // it cannot reach this computer — almost always a firewall blocking the media server.
+            timer.schedule({
+                val stillShown = session === active && loadGeneration == thisLoad && currentSubtitles.externalUrl != null
+                if (stillShown && !mediaServer.wasSubtitleFetched(sideLoaded.url)) {
+                    log.w { "receiver never fetched the subtitle track from ${sideLoaded.url}" }
+                    reportError(
+                        "${active.device.name} couldn't download subtitles from this computer. " +
+                            "Allow Nuvio through your firewall on private networks, then try again.",
+                    )
+                }
+            }, SUBTITLE_FETCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        }
+    }
+
+    private fun resolveContentType(media: CastMediaSource): String {
+        val url = media.url
+        CastMediaServer.contentTypeFromExtension(url)?.let { return it }
+        val probed = runCatching {
+            when {
+                url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true) ->
+                    mediaServer.probeContentType(url, media.headers)
+                else -> {
+                    val file = if (url.startsWith("file:", ignoreCase = true)) File(URI(url)) else File(url)
+                    file.inputStream().use { CastMediaServer.sniffContentType(it.readNBytes(16)) }
+                }
+            }
+        }.onFailure { error -> log.d { "content type probe failed: ${error.message}" } }.getOrNull()
+        return probed ?: "video/mp4"
     }
 
     private fun resolveContentUrl(receiverHost: String, media: CastMediaSource): String {
@@ -329,6 +412,13 @@ internal object DesktopCastManager {
         if (active != null && pendingEmbeddedMatch) {
             worker.execute { applyEmbeddedMatch(active, status) }
         }
+        if (active != null && pendingAudioTrackIndex > 0 && status.receiverAudioTracks.isNotEmpty()) {
+            val index = pendingAudioTrackIndex
+            pendingAudioTrackIndex = 0
+            status.receiverAudioTracks.getOrNull(index)?.let { track ->
+                worker.execute { active.setActiveAudioTrack(track.id) }
+            }
+        }
         update { it.copy(status = status) }
         if (status.isFailed) reportError("${state.activeDevice?.name ?: "The Cast device"} could not play this stream")
     }
@@ -336,7 +426,19 @@ internal object DesktopCastManager {
     private fun applyEmbeddedMatch(active: CastSession, status: CastMediaStatus) {
         if (!pendingEmbeddedMatch || hasSideLoadedTrack) return
         val tracks = status.receiverTextTracks
-        if (tracks.isEmpty()) return
+        if (tracks.isEmpty()) {
+            val mediaStarted = status.durationMs > 0L &&
+                (status.playerState == CastPlayerState.Playing || status.playerState == CastPlayerState.Paused)
+            if (mediaStarted) {
+                // The receiver found no text tracks of its own (e.g. subtitles inside an MKV).
+                pendingEmbeddedMatch = false
+                reportError(
+                    "Built-in subtitles in this file can't be shown on ${active.device.name}. " +
+                        "Pick a subtitle from the Addons tab instead.",
+                )
+            }
+            return
+        }
         pendingEmbeddedMatch = false
         val selection = currentSubtitles
         val language = selection.embeddedLanguage?.lowercase()?.substringBefore('-')
@@ -362,6 +464,8 @@ internal object DesktopCastManager {
         loadedSubtitleKey = null
         hasSideLoadedTrack = false
         pendingEmbeddedMatch = false
+        pendingAudioTrackIndex = 0
+        audioWarningKey = null
         worker.execute { mediaServer.stop() }
         update { current ->
             current.copy(
@@ -398,5 +502,27 @@ internal object DesktopCastManager {
         }.getOrDefault(false)
     }
 
+    /**
+     * Receivers decode AAC, MP3, Opus, Vorbis and FLAC themselves. AC-3/E-AC-3 only play when
+     * the TV or receiver passes them through, and DTS/TrueHD never do, so those streams play
+     * silently on most Chromecasts.
+     */
+    internal fun unsupportedAudioWarning(label: String?, deviceName: String): String? {
+        val text = label ?: return null
+        return when {
+            Regex("""\b(DTS(-HD)?|TrueHD)\b""", RegexOption.IGNORE_CASE).containsMatchIn(text) ->
+                "$deviceName can't play this stream's audio (${codecIn(text)}), so there may be no sound. " +
+                    "Try another audio track or a source with AAC audio."
+            Regex("""\bE?-?AC-?3\b""", RegexOption.IGNORE_CASE).containsMatchIn(text) ->
+                "This stream's audio (${codecIn(text)}) only plays if your TV supports it. " +
+                    "If there's no sound, try another audio track or a source with AAC audio."
+            else -> null
+        }
+    }
+
+    private fun codecIn(label: String): String =
+        Regex("""DTS-HD|DTS|TrueHD|E-AC-3(-JOC)?|AC-3""", RegexOption.IGNORE_CASE).find(label)?.value ?: "unsupported codec"
+
     private const val SIDE_LOADED_TRACK_ID = 1
+    private const val SUBTITLE_FETCH_TIMEOUT_SECONDS = 15L
 }

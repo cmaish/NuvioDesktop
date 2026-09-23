@@ -68,6 +68,7 @@ internal data class CastMediaStatus(
     val muted: Boolean = false,
     val activeTrackIds: List<Int> = emptyList(),
     val receiverTextTracks: List<CastReceiverTrack> = emptyList(),
+    val receiverAudioTracks: List<CastReceiverTrack> = emptyList(),
 ) {
     val isEnded: Boolean get() = playerState == CastPlayerState.Idle && idleReason == "FINISHED"
     val isFailed: Boolean get() = playerState == CastPlayerState.Idle && idleReason == "ERROR"
@@ -102,6 +103,8 @@ internal class CastSession(
     @Volatile private var lastStatusAtMs = System.currentTimeMillis()
     @Volatile private var receiverVolume: Float? = null
     @Volatile private var receiverMuted = false
+    /** Text track ids we side-loaded with the current media; the receiver's own ones come from status. */
+    @Volatile private var sideLoadedTextTrackIds: Set<Int> = emptySet()
     private var pollThread: Thread? = null
 
     /** Connects and launches the Default Media Receiver. Blocking; call off the UI thread. */
@@ -139,10 +142,14 @@ internal class CastSession(
         val requestId = nextRequestId()
         val future = CompletableFuture<JsonObject>()
         pendingRequests[requestId] = future
+        sideLoadedTextTrackIds = request.textTracks.map { it.id }.toSet()
         lastStatus = lastStatus.copy(
             playerState = CastPlayerState.Loading,
             idleReason = null,
             positionMs = request.startPositionMs,
+            activeTrackIds = request.activeTextTrackIds,
+            receiverTextTracks = emptyList(),
+            receiverAudioTracks = emptyList(),
         )
         lastStatusAtMs = System.currentTimeMillis()
         channel.send(CastNamespaces.MEDIA, transport, buildLoadPayload(request, requestId, sessionId).toString())
@@ -176,11 +183,31 @@ internal class CastSession(
 
     fun setPlaybackRate(rate: Float) = sendMediaCommand("SET_PLAYBACK_RATE") { put("playbackRate", rate.toDouble()) }
 
+    /**
+     * Activates [trackIds] as the text tracks. activeTrackIds covers every track type, so the
+     * currently active audio/video tracks are carried over; sending only text ids would switch
+     * the receiver's audio off.
+     */
     fun setActiveTextTracks(trackIds: List<Int>, style: CastTextTrackStyle?) {
+        val status = lastStatus
+        val textIds = sideLoadedTextTrackIds + status.receiverTextTracks.map { it.id }
+        editActiveTracks(mergeActiveTrackIds(status.activeTrackIds, textIds, trackIds), style)
+    }
+
+    /** Switches to one of the audio tracks the receiver reported for the current media. */
+    fun setActiveAudioTrack(trackId: Int) {
+        val status = lastStatus
+        val audioIds = status.receiverAudioTracks.map { it.id }.toSet()
+        if (trackId !in audioIds) return
+        editActiveTracks(mergeActiveTrackIds(status.activeTrackIds, audioIds, listOf(trackId)), style = null)
+    }
+
+    private fun editActiveTracks(activeIds: List<Int>, style: CastTextTrackStyle?) {
         sendMediaCommand("EDIT_TRACKS_INFO") {
-            putJsonArray("activeTrackIds") { trackIds.forEach { add(JsonPrimitive(it)) } }
+            putJsonArray("activeTrackIds") { activeIds.forEach { add(JsonPrimitive(it)) } }
             style?.let { put("textTrackStyle", it.toJson()) }
         }
+        lastStatus = lastStatus.copy(activeTrackIds = activeIds)
     }
 
     fun setVolume(level: Float) {
@@ -348,18 +375,9 @@ internal class CastSession(
             ?.takeIf { it.isFinite() && it > 0.0 }
             ?.let { (it * 1000).toLong() }
             ?: lastStatus.durationMs
-        val receiverTracks = media?.get("tracks")?.asArray()?.let { tracks ->
-            tracks.mapNotNull { it.asObject() }
-                .filter { it["type"]?.jsonPrimitive?.contentOrNull == "TEXT" }
-                .mapNotNull { track ->
-                    val id = track["trackId"]?.jsonPrimitive?.intOrNull ?: return@mapNotNull null
-                    CastReceiverTrack(
-                        id = id,
-                        name = track["name"]?.jsonPrimitive?.contentOrNull.orEmpty(),
-                        language = track["language"]?.jsonPrimitive?.contentOrNull,
-                    )
-                }
-        } ?: lastStatus.receiverTextTracks
+        val mediaTracks = media?.get("tracks")?.asArray()?.mapNotNull { it.asObject() }
+        val receiverTracks = mediaTracks?.let { receiverTracksOfType(it, "TEXT") } ?: lastStatus.receiverTextTracks
+        val receiverAudio = mediaTracks?.let { receiverTracksOfType(it, "AUDIO") } ?: lastStatus.receiverAudioTracks
         val volume = entry["volume"]?.asObject()
         val next = lastStatus.copy(
             playerState = playerState,
@@ -376,6 +394,7 @@ internal class CastSession(
                 ?.mapNotNull { it.jsonPrimitive.intOrNull }
                 ?: lastStatus.activeTrackIds,
             receiverTextTracks = receiverTracks,
+            receiverAudioTracks = receiverAudio,
         )
         publish(next, resetClock = true)
     }
@@ -476,6 +495,21 @@ internal class CastSession(
                     put("edgeColor", "#000000FF")
                 }
             }
+
+        internal fun mergeActiveTrackIds(current: List<Int>, replacedIds: Set<Int>, next: List<Int>): List<Int> =
+            (current.filterNot { it in replacedIds } + next).distinct()
+
+        private fun receiverTracksOfType(tracks: List<JsonObject>, type: String): List<CastReceiverTrack> =
+            tracks
+                .filter { it["type"]?.jsonPrimitive?.contentOrNull == type }
+                .mapNotNull { track ->
+                    val id = track["trackId"]?.jsonPrimitive?.intOrNull ?: return@mapNotNull null
+                    CastReceiverTrack(
+                        id = id,
+                        name = track["name"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+                        language = track["language"]?.jsonPrimitive?.contentOrNull,
+                    )
+                }
 
         private fun JsonElement.asObject(): JsonObject? = this as? JsonObject
         private fun JsonElement.asArray(): JsonArray? = this as? JsonArray

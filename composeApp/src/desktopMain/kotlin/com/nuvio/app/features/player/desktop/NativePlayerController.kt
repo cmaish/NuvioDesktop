@@ -175,7 +175,12 @@ internal class NativePlayerController(
             castSubtitleUrl = null
             castEmbeddedSubtitleIndex = -1
             if (casting) {
-                DesktopCastManager.changeMedia(castMediaFor(pending), castSubtitleSelection(), pending.initialPositionMs)
+                // The new source's audio tracks are not known until its player starts.
+                DesktopCastManager.changeMedia(
+                    castMediaFor(pending, includeAudio = false),
+                    castSubtitleSelection(),
+                    pending.initialPositionMs,
+                )
             }
             castSourceUrl = sourceUrl
         }
@@ -1088,6 +1093,10 @@ internal class NativePlayerController(
         }
         log.d { "selectAudioTrack index=$index trackId=$trackId count=${tracks.size} handle=$current" }
         NativePlayerBridge.selectAudioTrack(current, trackId)
+        if (isCasting) {
+            val position = tracks.indexOfFirst { it.index == index }
+            DesktopCastManager.selectAudioTrack(position.coerceAtLeast(0), tracks.getOrNull(position)?.label)
+        }
     }
 
     override fun selectSubtitleTrack(index: Int) {
@@ -1265,8 +1274,10 @@ internal class NativePlayerController(
         if (isCasting) DesktopCastManager.updateSubtitles(castSubtitleSelection())
     }
 
-    private fun castMediaFor(pending: PendingSource): CastMediaSource {
+    private fun castMediaFor(pending: PendingSource, includeAudio: Boolean = true): CastMediaSource {
         val state = controlsState
+        val audioTracks = if (includeAudio) getAudioTracks() else emptyList()
+        val selectedAudio = audioTracks.indexOfFirst { it.isSelected }
         return CastMediaSource(
             url = pending.sourceUrl,
             headers = pending.headerLines.toHeaderMap(),
@@ -1275,6 +1286,8 @@ internal class NativePlayerController(
                 .filter(String::isNotBlank)
                 .joinToString(" • "),
             imageUrl = state.openingArtwork?.takeIf(String::isNotBlank) ?: state.pauseOverlayLogo,
+            audioTrackLabel = audioTracks.getOrNull(selectedAudio)?.label,
+            audioTrackIndex = selectedAudio.coerceAtLeast(0),
         )
     }
 
