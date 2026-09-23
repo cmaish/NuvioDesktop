@@ -1,11 +1,13 @@
 package com.nuvio.app.features.player.desktop.cast
 
 import co.touchlab.kermit.Logger
+import com.nuvio.app.core.storage.DesktopStorage
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.net.InetAddress
 import java.net.URI
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -23,6 +25,8 @@ internal data class CastMediaSource(
     val audioTrackLabel: String? = null,
     /** Position of that track among the stream's audio tracks. */
     val audioTrackIndex: Int = 0,
+    /** Duration known to the local player; a converted stream can't tell the receiver its length. */
+    val durationMs: Long = 0L,
 )
 
 /** The subtitle the local player shows, mirrored onto the receiver. */
@@ -69,6 +73,8 @@ internal object DesktopCastManager {
     }
     private val listeners = mutableSetOf<() -> Unit>()
     private val mediaServer = CastMediaServer()
+    private val transcoder = CastTranscoder { DesktopStorage.rootDir.resolve("cast-ffmpeg").toFile() }
+    private val probes = ConcurrentHashMap<String, CastMediaProbe>()
     private val httpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
@@ -93,6 +99,11 @@ internal object DesktopCastManager {
     @Volatile private var audioWarningKey: String? = null
     /** Bumped on every LOAD so delayed checks can tell the media they were scheduled for is gone. */
     @Volatile private var loadGeneration = 0L
+    /** True while the receiver plays an ffmpeg conversion rather than the source itself. */
+    @Volatile private var isConverting = false
+    /** Source position where the converted stream starts; the receiver's clock starts at zero there. */
+    @Volatile private var streamOffsetMs = 0L
+    @Volatile private var convertedDurationMs = 0L
     @Volatile private var sessionEndedListener: ((positionMs: Long, wasPlaying: Boolean, reason: String?) -> Unit)? = null
 
     val isCasting: Boolean
@@ -213,7 +224,7 @@ internal object DesktopCastManager {
             when {
                 subtitles.externalUrl != null && key != loadedSubtitleKey -> {
                     // A side-loaded track can only be attached by (re)loading the media.
-                    val status = active.status()
+                    val status = sourceStatus(active)
                     runCatching {
                         loadMedia(
                             active,
@@ -241,16 +252,22 @@ internal object DesktopCastManager {
     fun selectAudioTrack(index: Int, label: String?) {
         val media = currentMedia ?: return
         if (media.audioTrackIndex == index) return
-        currentMedia = media.copy(audioTrackIndex = index, audioTrackLabel = label)
+        val updated = media.copy(audioTrackIndex = index, audioTrackLabel = label)
+        currentMedia = updated
         withSession { active ->
+            if (isConverting || (CastTranscoder.needsAudioConversion(label) && transcoder.isAvailable)) {
+                // ffmpeg picks the track; restart the stream with the new one.
+                val status = sourceStatus(active)
+                runCatching {
+                    loadMedia(active, updated, currentSubtitles, status.positionMs, status.playerState != CastPlayerState.Paused)
+                }.onFailure { error -> reportError(error.message ?: "Could not switch the audio track") }
+                return@withSession
+            }
             val status = active.status()
             val track = status.receiverAudioTracks.getOrNull(index)
             val stillLoading = status.playerState == CastPlayerState.Loading || status.durationMs <= 0L
             when {
-                track != null -> {
-                    active.setActiveAudioTrack(track.id)
-                    unsupportedAudioWarning(label, active.device.name)?.let(::reportError)
-                }
+                track != null -> active.setActiveAudioTrack(track.id)
                 status.receiverAudioTracks.isEmpty() && stillLoading -> pendingAudioTrackIndex = index
                 else -> reportError("${active.device.name} can't switch audio tracks for this stream.")
             }
@@ -261,19 +278,42 @@ internal object DesktopCastManager {
 
     fun pause() = withSession { it.pause() }
 
-    fun seekTo(positionMs: Long) = withSession { it.seekTo(positionMs) }
+    fun seekTo(positionMs: Long) = withSession { active -> seekOn(active, positionMs) }
 
     fun seekBy(offsetMs: Long) = withSession { active ->
-        val status = active.status()
+        val status = sourceStatus(active)
         val target = (status.positionMs + offsetMs).coerceAtLeast(0L)
-        active.seekTo(if (status.durationMs > 0L) target.coerceAtMost(status.durationMs) else target)
+        seekOn(active, if (status.durationMs > 0L) target.coerceAtMost(status.durationMs) else target)
+    }
+
+    /** Runs on the worker. A converted stream can't seek, so it restarts ffmpeg from [positionMs]. */
+    private fun seekOn(active: CastSession, positionMs: Long) {
+        if (!isConverting) {
+            active.seekTo(positionMs)
+            return
+        }
+        val media = currentMedia ?: return
+        val paused = active.status().playerState == CastPlayerState.Paused
+        runCatching { loadMedia(active, media, currentSubtitles, positionMs, autoplay = !paused) }
+            .onFailure { error -> reportError(error.message ?: "Could not seek on ${active.device.name}") }
     }
 
     fun setPlaybackRate(rate: Float) = withSession { it.setPlaybackRate(rate) }
 
     fun setVolume(level: Float) = withSession { it.setVolume(level) }
 
-    fun currentStatus(): CastMediaStatus? = session?.status() ?: state.status
+    fun currentStatus(): CastMediaStatus? = session?.let(::sourceStatus) ?: state.status
+
+    /** The receiver's status on the source's timeline (a converted stream restarts at zero). */
+    private fun sourceStatus(active: CastSession): CastMediaStatus = toSourceTimeline(active.status())
+
+    private fun toSourceTimeline(status: CastMediaStatus): CastMediaStatus {
+        if (!isConverting) return status
+        val duration = convertedDurationMs.takeIf { it > 0L }
+            ?: status.durationMs.takeIf { it > 0L }?.plus(streamOffsetMs)
+            ?: 0L
+        return status.copy(positionMs = status.positionMs + streamOffsetMs, durationMs = duration)
+    }
 
     /** Ends casting and stops the receiver app. [onEnded] from [connect] still runs. */
     fun stopCasting() {
@@ -284,7 +324,7 @@ internal object DesktopCastManager {
             }
             return
         }
-        val status = active.status()
+        val status = sourceStatus(active)
         active.stop()
         onSessionEnded(ended = active, reason = null, expected = true, lastStatus = status)
     }
@@ -303,10 +343,49 @@ internal object DesktopCastManager {
         autoplay: Boolean,
     ) {
         val host = active.device.host
-        val contentUrl = resolveContentUrl(host, media)
-        val contentType = resolveContentType(media)
+        // Whatever was converting for the previous media or position is no longer wanted.
+        mediaServer.stopProcessStreams()
+        val needsConversion = CastTranscoder.needsAudioConversion(media.audioTrackLabel)
+        val convert = needsConversion && transcoder.isAvailable
+        val contentUrl: String
+        val contentType: String
+        val receiverStartMs: Long
+        if (convert) {
+            val input = localPathOrUrl(media.url)
+            val probe = probes.getOrPut(media.url) {
+                transcoder.probe(input, media.headers) ?: CastMediaProbe(durationMs = 0L, videoCodec = null)
+            }
+            val spec = CastTranscodeSpec(
+                inputUrl = input,
+                headers = media.headers,
+                startMs = positionMs,
+                audioTrackIndex = media.audioTrackIndex,
+                videoCodec = probe.videoCodec,
+            )
+            // The receiver's zero is the keyframe ffmpeg starts from, not the exact seek point.
+            val streamStartMs = if (positionMs > 0L) {
+                transcoder.keyframeStart(input, media.headers, positionMs) ?: positionMs
+            } else {
+                0L
+            }
+            contentUrl = mediaServer.publishProcessStream(host, "stream.mp4") { transcoder.start(spec) }
+            contentType = "video/mp4"
+            receiverStartMs = 0L
+            isConverting = true
+            streamOffsetMs = streamStartMs
+            convertedDurationMs = maxOf(media.durationMs, probe.durationMs)
+        } else {
+            contentUrl = resolveContentUrl(host, media)
+            contentType = resolveContentType(media)
+            receiverStartMs = positionMs
+            isConverting = false
+            streamOffsetMs = 0L
+            convertedDurationMs = 0L
+        }
+        // Cue times follow the stream the receiver plays, which starts at the offset when converting.
+        val subtitleShiftMs = subtitles.delayMs - streamOffsetMs.toInt()
         val sideLoaded = subtitles.externalUrl?.let { url ->
-            runCatching { loadSubtitleVtt(url, subtitles.delayMs) ?: error("No subtitle lines could be read") }
+            runCatching { loadSubtitleVtt(url, subtitleShiftMs) ?: error("No subtitle lines could be read") }
                 .onFailure { error ->
                     log.w(error) { "could not prepare subtitle for cast" }
                     reportError("Couldn't load the selected subtitles for casting.")
@@ -324,9 +403,13 @@ internal object DesktopCastManager {
         hasSideLoadedTrack = sideLoaded != null
         loadedSubtitleKey = if (sideLoaded != null) subtitles.sideLoadKey() else null
         pendingEmbeddedMatch = sideLoaded == null && subtitles.externalUrl == null && !subtitles.isOff
-        pendingAudioTrackIndex = media.audioTrackIndex
+        // When converting, ffmpeg already picked the audio track.
+        pendingAudioTrackIndex = if (convert) 0 else media.audioTrackIndex
         val thisLoad = ++loadGeneration
-        log.d { "cast load contentType=$contentType subtitles=${sideLoaded != null} audio=${media.audioTrackLabel}" }
+        log.d {
+            "cast load contentType=$contentType convert=$convert offsetMs=$streamOffsetMs " +
+                "subtitles=${sideLoaded != null} audio=${media.audioTrackLabel}"
+        }
         active.load(
             CastLoadRequest(
                 contentUrl = contentUrl,
@@ -334,7 +417,7 @@ internal object DesktopCastManager {
                 title = media.title,
                 subtitle = media.subtitle,
                 imageUrl = media.imageUrl?.takeIf { it.startsWith("http", ignoreCase = true) },
-                startPositionMs = positionMs,
+                startPositionMs = receiverStartMs,
                 autoplay = autoplay,
                 textTracks = listOfNotNull(sideLoaded),
                 activeTextTrackIds = if (sideLoaded != null) listOf(SIDE_LOADED_TRACK_ID) else emptyList(),
@@ -344,7 +427,11 @@ internal object DesktopCastManager {
         val warningKey = "${media.url}|${media.audioTrackLabel}"
         if (warningKey != audioWarningKey) {
             audioWarningKey = warningKey
-            unsupportedAudioWarning(media.audioTrackLabel, active.device.name)?.let(::reportError)
+            when {
+                convert -> reportError("Converting ${codecIn(media.audioTrackLabel.orEmpty())} audio for ${active.device.name}.")
+                needsConversion -> unsupportedAudioWarning(media.audioTrackLabel, active.device.name)
+                    ?.let { reportError("$it (ffmpeg, needed to convert it, wasn't found.)") }
+            }
         }
         if (sideLoaded != null) {
             // The receiver fetches an active text track right after loading. If it never asks,
@@ -361,6 +448,9 @@ internal object DesktopCastManager {
             }, SUBTITLE_FETCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         }
     }
+
+    private fun localPathOrUrl(url: String): String =
+        if (url.startsWith("file:", ignoreCase = true)) File(URI(url)).absolutePath else url
 
     private fun resolveContentType(media: CastMediaSource): String {
         val url = media.url
@@ -419,7 +509,7 @@ internal object DesktopCastManager {
                 worker.execute { active.setActiveAudioTrack(track.id) }
             }
         }
-        update { it.copy(status = status) }
+        update { it.copy(status = toSourceTimeline(status)) }
         if (status.isFailed) reportError("${state.activeDevice?.name ?: "The Cast device"} could not play this stream")
     }
 
@@ -456,7 +546,7 @@ internal object DesktopCastManager {
             if (ended != null && session !== ended) return
             if (ended == null && state.connectionState == CastConnectionState.Idle) return
         }
-        val status = lastStatus ?: ended?.status() ?: state.status
+        val status = lastStatus ?: ended?.let(::sourceStatus) ?: state.status
         session = null
         val listener = sessionEndedListener
         sessionEndedListener = null
@@ -466,6 +556,9 @@ internal object DesktopCastManager {
         pendingEmbeddedMatch = false
         pendingAudioTrackIndex = 0
         audioWarningKey = null
+        isConverting = false
+        streamOffsetMs = 0L
+        convertedDurationMs = 0L
         worker.execute { mediaServer.stop() }
         update { current ->
             current.copy(

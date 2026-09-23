@@ -378,6 +378,8 @@ jobs:
       SENTRY_DESKTOP_DSN: ${{ secrets.SENTRY_DESKTOP_DSN }}
       WEBVIEW2_VERSION: 1.0.4078.44
       TORRSERVER_WINDOWS_SHA256: 13031185a54abe0f729f9f3bdb7271a349a89ac8c559327d773c66007ed604f4
+      FFMPEG_WINDOWS_URL: https://github.com/GyanD/codexffmpeg/releases/download/7.1.1/ffmpeg-7.1.1-essentials_build.zip
+      FFMPEG_WINDOWS_SHA256: 04861d3339c5ebe38b56c19a15cf2c0cc97f5de4fa8910e4d47e5e6404e4a2d4
 
     steps:
       - name: Check out release source
@@ -407,6 +409,19 @@ jobs:
             echo "The bundled Windows TorrServer executable checksum does not match." >&2
             exit 1
           fi
+
+      - name: Fetch ffmpeg for Chromecast audio conversion
+        shell: bash
+        run: |
+          # Pinned, versioned GPL build (Nuvio is GPL-3.0); bundled like TorrServer and
+          # extracted at runtime to convert audio Chromecasts can't play (DTS, TrueHD, AC-3).
+          curl -fsSL -o "${RUNNER_TEMP}/ffmpeg.zip" "${FFMPEG_WINDOWS_URL}"
+          echo "${FFMPEG_WINDOWS_SHA256}  ${RUNNER_TEMP}/ffmpeg.zip" | sha256sum -c -
+          unzip -q -o "${RUNNER_TEMP}/ffmpeg.zip" -d "${RUNNER_TEMP}/ffmpeg"
+          target="composeApp/src/desktopMain/resources/ffmpeg/windows-amd64"
+          mkdir -p "${target}"
+          cp "${RUNNER_TEMP}"/ffmpeg/*/bin/ffmpeg.exe "${target}/ffmpeg.exe"
+          ls -l "${target}/ffmpeg.exe"
 
       - name: Set up Java
         uses: actions/setup-java@v5

@@ -1288,6 +1288,13 @@ internal class NativePlayerController(
             imageUrl = state.openingArtwork?.takeIf(String::isNotBlank) ?: state.pauseOverlayLogo,
             audioTrackLabel = audioTracks.getOrNull(selectedAudio)?.label,
             audioTrackIndex = selectedAudio.coerceAtLeast(0),
+            durationMs = if (includeAudio) {
+                handle.takeIf { it != 0L }
+                    ?.let { current -> runCatching { NativePlayerBridge.durationMs(current) }.getOrNull() }
+                    ?: 0L
+            } else {
+                0L
+            },
         )
     }
 

@@ -38,6 +38,9 @@ internal class CastMediaServer {
     private val files = ConcurrentHashMap<String, File>()
     private val proxyScopes = ConcurrentHashMap<String, Map<String, String>>()
     private val fetchedSubtitles = ConcurrentHashMap.newKeySet<String>()
+    private val processStreams = ConcurrentHashMap<String, () -> Process>()
+    /** The running process per stream token; a new request for the same token replaces it. */
+    private val runningProcesses = ConcurrentHashMap<String, Process>()
     private var server: HttpServer? = null
     private var executor: ExecutorService? = null
     private val httpClient: OkHttpClient by lazy {
@@ -81,6 +84,9 @@ internal class CastMediaServer {
         executor = null
         subtitles.clear()
         fetchedSubtitles.clear()
+        processStreams.clear()
+        runningProcesses.values.forEach { it.destroyForcibly() }
+        runningProcesses.clear()
         files.clear()
         proxyScopes.clear()
     }
@@ -111,6 +117,24 @@ internal class CastMediaServer {
         val token = newToken()
         proxyScopes[token] = headers
         return proxyUrl(baseUrlFor(receiverHost), token, url)
+    }
+
+    /**
+     * Publishes a stream produced by a process (the ffmpeg audio conversion). Each request
+     * starts a fresh process, since a pipe can't be rewound; the previous one is stopped.
+     */
+    fun publishProcessStream(receiverHost: String, name: String, open: () -> Process): String {
+        start()
+        val token = newToken()
+        processStreams[token] = open
+        return "${baseUrlFor(receiverHost)}/t/$token/${name.urlEncode()}"
+    }
+
+    /** Stops every running process stream, e.g. before replacing the media. */
+    fun stopProcessStreams() {
+        processStreams.clear()
+        runningProcesses.values.forEach { it.destroyForcibly() }
+        runningProcesses.clear()
     }
 
     /** Whether the receiver has requested the subtitle published at [url] yet. */
@@ -167,6 +191,7 @@ internal class CastMediaServer {
             "s" -> serveSubtitle(exchange, token)
             "f" -> serveFile(exchange, token)
             "p" -> serveProxy(exchange, token)
+            "t" -> serveProcessStream(exchange, token)
             else -> exchange.sendResponseHeaders(404, -1)
         }
     }
@@ -219,6 +244,34 @@ internal class CastMediaServer {
                     remaining -= read
                 }
             }
+        }
+    }
+
+    private fun serveProcessStream(exchange: HttpExchange, token: String) {
+        val open = processStreams[token] ?: run {
+            exchange.sendResponseHeaders(404, -1)
+            return
+        }
+        exchange.responseHeaders.add("Content-Type", "video/mp4")
+        // A live conversion has no length and can't serve byte ranges.
+        exchange.responseHeaders.add("Accept-Ranges", "none")
+        if (exchange.requestMethod.equals("HEAD", ignoreCase = true)) {
+            exchange.sendResponseHeaders(200, -1)
+            return
+        }
+        val process = open()
+        runningProcesses.put(token, process)?.destroyForcibly()
+        try {
+            exchange.sendResponseHeaders(200, 0)
+            exchange.responseBody.use { output ->
+                process.inputStream.use { input -> input.copyTo(output, 64 * 1024) }
+            }
+        } catch (error: java.io.IOException) {
+            // The receiver closed the connection (seek, stop, or a new request).
+            log.d { "process stream closed: ${error.message}" }
+        } finally {
+            process.destroyForcibly()
+            runningProcesses.remove(token, process)
         }
     }
 
