@@ -27,6 +27,18 @@ const nextEpisodeButton = document.getElementById("nextEpisodeButton");
 const nextEpisodeButtonLabel = document.getElementById("nextEpisodeButtonLabel");
 const fullscreenButton = document.getElementById("fullscreenButton");
 const pipButton = document.getElementById("pipButton");
+const castButton = document.getElementById("castButton");
+const castIcon = document.getElementById("castIcon");
+const castBanner = document.getElementById("castBanner");
+const castBannerText = document.getElementById("castBannerText");
+const castModal = document.getElementById("castModal");
+const castPanelTitle = document.getElementById("castPanelTitle");
+const castRefreshButton = document.getElementById("castRefreshButton");
+const castCloseButton = document.getElementById("castCloseButton");
+const castStatus = document.getElementById("castStatus");
+const castDeviceList = document.getElementById("castDeviceList");
+const castActions = document.getElementById("castActions");
+const castStopButton = document.getElementById("castStopButton");
 const fullscreenIcon = document.getElementById("fullscreenIcon");
 const title = document.getElementById("title");
 const episode = document.getElementById("episode");
@@ -298,6 +310,24 @@ let state = {
   showSources: false,
   showEpisodes: false,
   showExternalPlayer: false,
+  castLabel: "Cast",
+  castPanelTitle: "Cast to device",
+  castSearchingLabel: "Searching for devices...",
+  castNoDevicesLabel: "No Cast devices found on this network",
+  castConnectingLabel: "Connecting to %s...",
+  castConnectedLabel: "Casting to %s",
+  castStopLabel: "Stop casting",
+  castRefreshLabel: "Refresh",
+  castState: "idle",
+  castDeviceName: "",
+  castDiscovering: false,
+  castDevices: [],
+  castPositionMs: 0,
+  castDurationMs: 0,
+  castIsPlaying: false,
+  castIsLoading: false,
+  castErrorMessage: "",
+  castErrorToken: 0,
   durationMs: 0,
   positionMs: 0,
   audioTracks: [],
@@ -467,7 +497,10 @@ const chromeInteractionSelector = [
   ".next-episode-card",
 ].join(",");
 
-const send = (type, value = 0) => {
+const isCasting = () => state.castState === "connected" || state.castState === "connecting";
+
+const send = (rawType, value = 0) => {
+  const type = isCasting() && String(rawType).startsWith("setPlaybackState") ? `cast:${rawType}` : rawType;
   const bridge = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.player;
   if (bridge) {
     bridge.postMessage({ type, value });
@@ -924,6 +957,7 @@ const modalByName = {
   episodes: episodesModal,
   submitIntro: submitIntroModal,
   p2pConsent: p2pConsentModal,
+  cast: castModal,
 };
 const modalElements = Object.values(modalByName);
 const modalCloseTimers = new Map();
@@ -1909,6 +1943,102 @@ const renderSubmitIntroModal = () => {
   submitIntroStatus.textContent = submitIntroDraft.status || state.submitIntroStatusMessage || "";
 };
 
+const formatCastLabel = (template, deviceName) =>
+  String(template || "").replace("%s", deviceName || "");
+
+const renderCastModal = () => {
+  const castState = state.castState || "idle";
+  const deviceName = state.castDeviceName || "";
+  castPanelTitle.textContent = state.castPanelTitle || "Cast to device";
+  castRefreshButton.textContent = state.castRefreshLabel || "Refresh";
+  castRefreshButton.disabled = Boolean(state.castDiscovering);
+  castCloseButton.textContent = state.panelCloseLabel || "Close";
+  castStopButton.textContent = state.castStopLabel || "Stop casting";
+  castActions.hidden = castState === "idle";
+  if (castState === "connected") {
+    castStatus.textContent = formatCastLabel(state.castConnectedLabel || "Casting to %s", deviceName);
+  } else if (castState === "connecting") {
+    castStatus.textContent = formatCastLabel(state.castConnectingLabel || "Connecting to %s...", deviceName);
+  } else if (state.castDiscovering) {
+    castStatus.textContent = state.castSearchingLabel || "Searching for devices...";
+  } else {
+    castStatus.textContent = "";
+  }
+  castDeviceList.textContent = "";
+  const devices = Array.isArray(state.castDevices) ? state.castDevices : [];
+  if (devices.length === 0) {
+    if (!state.castDiscovering) {
+      appendEmptyTrackState(castDeviceList, state.castNoDevicesLabel || "No Cast devices found on this network");
+    }
+    return;
+  }
+  devices.forEach(device => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = `track-row cast-device-row${device.isActive ? " selected" : ""}`;
+    row.addEventListener("click", event => {
+      event.stopPropagation();
+      if (device.isActive) return;
+      send("castSelectDevice", Number(device.index) || 0);
+    });
+    const copy = document.createElement("span");
+    copy.className = "cast-device-copy";
+    const name = document.createElement("span");
+    name.className = "cast-device-name";
+    name.textContent = device.name || "Chromecast";
+    copy.appendChild(name);
+    if (device.model) {
+      const model = document.createElement("span");
+      model.className = "cast-device-model";
+      model.textContent = device.model;
+      copy.appendChild(model);
+    }
+    row.appendChild(copy);
+    if (device.isActive) row.appendChild(buildCheckIcon());
+    castDeviceList.appendChild(row);
+  });
+};
+
+const syncCastChrome = () => {
+  const castState = state.castState || "idle";
+  const casting = castState !== "idle";
+  const label = state.castLabel || "Cast";
+  if (castButton) {
+    castButton.setAttribute("aria-label", label);
+    castButton.setAttribute("title", casting
+      ? formatCastLabel(state.castConnectedLabel || "Casting to %s", state.castDeviceName)
+      : label);
+    castButton.classList.toggle("cast-active", casting);
+  }
+  if (castIcon) castIcon.setAttribute("href", casting ? "#icon-cast-connected" : "#icon-cast");
+  if (castBanner && castBannerText) {
+    castBannerText.textContent = castState === "connecting"
+      ? formatCastLabel(state.castConnectingLabel || "Connecting to %s...", state.castDeviceName)
+      : formatCastLabel(state.castConnectedLabel || "Casting to %s", state.castDeviceName);
+    castBanner.classList.toggle("visible", casting);
+    castBanner.setAttribute("aria-hidden", casting ? "false" : "true");
+  }
+};
+
+// While casting, the timeline and play state mirror the receiver instead of the paused local player.
+const applyCastPlaybackState = () => {
+  if (!isCasting()) return;
+  const castIsPlaying = Boolean(state.castIsPlaying);
+  lastNativeIsPlaying = castIsPlaying;
+  if (pendingIsPlaying !== null && castIsPlaying === pendingIsPlaying) {
+    pendingIsPlaying = null;
+    window.clearTimeout(pendingPlaybackTimer);
+    pendingPlaybackTimer = 0;
+  }
+  state = {
+    ...state,
+    durationMs: Math.max(0, Number(state.castDurationMs) || 0),
+    positionMs: Math.max(0, Number(state.castPositionMs) || 0),
+    isPlaying: pendingIsPlaying === null ? castIsPlaying : pendingIsPlaying,
+    isLoading: Boolean(state.castIsLoading),
+  };
+};
+
 const renderP2pConsentModal = () => {
   p2pConsentTitle.textContent = state.p2pConsentTitle || "P2P Streaming";
   p2pConsentBody.textContent = state.p2pConsentBody || "";
@@ -1925,6 +2055,7 @@ const renderActiveModal = () => {
   if (activeModal === "episodes") renderEpisodesModal();
   if (activeModal === "submitIntro") renderSubmitIntroModal();
   if (activeModal === "p2pConsent") renderP2pConsentModal();
+  if (activeModal === "cast") renderCastModal();
 };
 
 window.nuvioNativeViewportChanged = () => {
@@ -2901,6 +3032,30 @@ const cancelP2pConsent = () => {
   closePlayerModal();
 };
 
+if (castButton) {
+  castButton.addEventListener("click", event => {
+    event.stopPropagation();
+    noteChromeActivity(true);
+    // Show the searching state right away; Kotlin confirms it with the next controls push.
+    if ((state.castState || "idle") === "idle") state = { ...state, castDiscovering: true };
+    openPlayerModal("cast");
+    send("castOpen", 0);
+  });
+}
+castRefreshButton.addEventListener("click", event => {
+  event.stopPropagation();
+  send("castOpen", 0);
+});
+castCloseButton.addEventListener("click", event => {
+  event.stopPropagation();
+  closePlayerModal();
+});
+castStopButton.addEventListener("click", event => {
+  event.stopPropagation();
+  send("castStop", 0);
+  closePlayerModal();
+});
+
 p2pConsentCloseButton.addEventListener("click", event => {
   event.stopPropagation();
   cancelP2pConsent();
@@ -2982,7 +3137,8 @@ window.playerUpdate = update => {
   const subtitleTracks = normalizeTracks(update.subtitleTracks);
   const audioTracksChanged = trackListSignature(audioTracks) !== trackListSignature(state.audioTracks);
   const subtitleTracksChanged = trackListSignature(subtitleTracks) !== trackListSignature(state.subtitleTracks);
-  const nativeIsPlaying = !Boolean(update.paused);
+  const casting = isCasting();
+  const nativeIsPlaying = casting ? Boolean(state.castIsPlaying) : !Boolean(update.paused);
   lastNativeIsPlaying = nativeIsPlaying;
   if (pendingIsPlaying !== null && nativeIsPlaying === pendingIsPlaying) {
     pendingIsPlaying = null;
@@ -2991,10 +3147,10 @@ window.playerUpdate = update => {
   }
   state = {
     ...state,
-    durationMs,
-    positionMs,
+    durationMs: casting ? state.durationMs : durationMs,
+    positionMs: casting ? state.positionMs : positionMs,
     isPlaying: pendingIsPlaying === null ? nativeIsPlaying : pendingIsPlaying,
-    isLoading: Boolean(update.loading || update.isLoading),
+    isLoading: casting ? state.isLoading : Boolean(update.loading || update.isLoading),
     volumeLevel,
     audioTracks,
     subtitleTracks,
@@ -3020,6 +3176,8 @@ window.playerControls = nextState => {
   const previousCloseToken = Number(state.closeModalsToken) || 0;
   const previousSubmitIntroSuccessToken = Number(state.submitIntroSuccessToken) || 0;
   const previousNotificationToken = Number(state.notificationToken) || 0;
+  const previousCastErrorToken = Number(state.castErrorToken) || 0;
+  const previousCastState = state.castState || "idle";
   const previousResizeLabel = state.resizeModeLabel || "";
   const previousSpeedLabel = state.playbackSpeedLabel || "";
   const previousEpisodeStreamsVisible = Boolean(state.episodeStreamsVisible);
@@ -3054,6 +3212,17 @@ window.playerControls = nextState => {
   if (notificationToken !== previousNotificationToken) {
     showPlayerToast(state.notificationMessage);
   }
+  const castErrorToken = Number(state.castErrorToken) || 0;
+  if (castErrorToken !== previousCastErrorToken && state.castErrorMessage) {
+    showPlayerToast(state.castErrorMessage, { durationMs: 4000, icon: "icon-cast" });
+  }
+  applyCastPlaybackState();
+  if (previousCastState !== "idle" && (state.castState || "idle") === "idle") {
+    // Hand the play state back to the local player's own reports.
+    pendingIsPlaying = null;
+  }
+  syncCastChrome();
+  if (activeModal === "cast") renderCastModal();
   if (state.showP2pConsent && activeModal !== "p2pConsent") {
     openPlayerModal("p2pConsent");
   } else if (!state.showP2pConsent && activeModal === "p2pConsent") {
