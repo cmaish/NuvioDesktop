@@ -1,0 +1,171 @@
+name: Build Windows Test MSI
+
+# Unsigned Windows x64 test build for pull requests and manual runs. Unlike the release
+# workflow it needs no release environment: local.properties is used when the optional
+# NUVIO_DESKTOP_LOCAL_PROPERTIES_BASE64 secret exists, and nothing is uploaded to Sentry.
+# Without that secret the app builds and plays media, but account sign-in, sync and Trakt
+# have no backend keys.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "composeApp/**"
+      - "desktopSentry/**"
+      - "gradle/**"
+      - "*.gradle.kts"
+      - "gradle.properties"
+      - ".github/workflows/desktop-windows-test-build.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-windows-test-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows x64 test MSI
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      LOCAL_PROPERTIES_BASE64: ${{ secrets.NUVIO_DESKTOP_LOCAL_PROPERTIES_BASE64 }}
+      WEBVIEW2_VERSION: 1.0.4078.44
+      TORRSERVER_WINDOWS_SHA256: 13031185a54abe0f729f9f3bdb7271a349a89ac8c559327d773c66007ed604f4
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      # The Windows runtime binaries are ~170 MB of Git LFS objects; cache them so repeated
+      # pull request runs do not use up the repository's LFS bandwidth.
+      - name: Restore Git LFS objects
+        uses: actions/cache@v4
+        with:
+          path: .git/lfs/objects
+          key: windows-lfs-${{ hashFiles('composeApp/src/desktopMain/native/windows/runtime/libmpv-2.dll', 'composeApp/src/desktopMain/resources/torrserver/windows-amd64/TorrServer.exe') }}
+
+      - name: Fetch Windows runtime
+        shell: bash
+        run: |
+          git lfs pull --include="composeApp/src/desktopMain/native/windows/runtime/**,composeApp/src/desktopMain/resources/torrserver/windows-amd64/TorrServer.exe" --exclude=""
+          runtime_path="composeApp/src/desktopMain/native/windows/runtime/libmpv-2.dll"
+          if [[ ! -f "${runtime_path}" ]] || (( $(wc -c < "${runtime_path}") < 1000000 )); then
+            echo "The bundled Windows libmpv runtime was not materialized from Git LFS." >&2
+            exit 1
+          fi
+          torrserver_path="composeApp/src/desktopMain/resources/torrserver/windows-amd64/TorrServer.exe"
+          torrserver_sha256="$(sha256sum "${torrserver_path}" | awk '{print $1}')"
+          if [[ "${torrserver_sha256}" != "${TORRSERVER_WINDOWS_SHA256}" ]]; then
+            echo "The bundled Windows TorrServer executable checksum does not match." >&2
+            exit 1
+          fi
+
+      - name: Configure runtime properties
+        shell: bash
+        run: |
+          if [[ -z "${LOCAL_PROPERTIES_BASE64}" ]]; then
+            echo "::notice::NUVIO_DESKTOP_LOCAL_PROPERTIES_BASE64 is not set; building without backend keys."
+            exit 0
+          fi
+          printf '%s' "${LOCAL_PROPERTIES_BASE64}" | base64 --decode > local.properties
+          # Signing and SDK paths from a developer machine do not apply on the runner.
+          sed -i -E '/^[[:space:]]*(sdk\.dir|NUVIO_RELEASE_(STORE_FILE|STORE_PASSWORD|KEY_ALIAS|KEY_PASSWORD)|NUVIO_MACOS_(SIGNING_IDENTITY|NOTARY_APPLE_ID|NOTARY_TEAM_ID|NOTARY_PASSWORD|NOTARY_KEYCHAIN_PROFILE|NOTARY_KEYCHAIN_PATH))[[:space:]]*=/d' local.properties
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Install WebView2 SDK
+        shell: pwsh
+        run: |
+          nuget install Microsoft.Web.WebView2 `
+            -Version $env:WEBVIEW2_VERSION `
+            -OutputDirectory "$env:RUNNER_TEMP\nuget" `
+            -DirectDownload `
+            -NonInteractive `
+            -NoCache
+
+          $webView2Root = Join-Path $env:RUNNER_TEMP "nuget\Microsoft.Web.WebView2.$env:WEBVIEW2_VERSION"
+          $loaderLibrary = Join-Path $webView2Root "build\native\x64\WebView2Loader.dll.lib"
+          if (-not (Test-Path $loaderLibrary)) {
+            throw "WebView2Loader.dll.lib was not found at $loaderLibrary"
+          }
+          "WEBVIEW2_ROOT=$webView2Root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          & .\gradlew.bat `
+            :composeApp:packageReleaseMsi `
+            "-Pnuvio.webview2.dir=$env:WEBVIEW2_ROOT" `
+            "-Pcompose.desktop.packaging.checkJdkVendor=false" `
+            --no-configuration-cache `
+            --no-daemon `
+            --stacktrace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify MSI
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem "composeApp\build\compose\release-msis" -Filter "Nuvio-Windows-x64-*.msi" | Select-Object -First 1
+          if ($null -eq $msi) {
+            throw "No MSI was produced in composeApp\build\compose\release-msis."
+          }
+          $extractDir = Join-Path $env:RUNNER_TEMP "nuvio-msi"
+          $extractLog = Join-Path $env:RUNNER_TEMP "nuvio-msi-extract.log"
+          New-Item -ItemType Directory -Path $extractDir | Out-Null
+          $extract = Start-Process -FilePath msiexec.exe -Wait -PassThru -ArgumentList @(
+            "/a", "`"$($msi.FullName)`"", "/qn", "TARGETDIR=`"$extractDir`"", "/l*v", "`"$extractLog`""
+          )
+          if ($extract.ExitCode -ne 0) {
+            Get-Content $extractLog -Tail 200
+            throw "MSI administrative extraction failed with exit code $($extract.ExitCode)."
+          }
+
+          $appJar = Get-ChildItem $extractDir -Recurse -Filter "composeApp-desktop-*.jar" | Select-Object -First 1
+          if ($null -eq $appJar) {
+            throw "The extracted MSI does not contain the desktop application JAR."
+          }
+          $jarEntries = & jar tf $appJar.FullName
+          $requiredEntries = @(
+            "native/windows/player_bridge.dll",
+            "native/windows/libmpv-2.dll",
+            "native/windows/WebView2Loader.dll",
+            "torrserver/windows-amd64/TorrServer.exe",
+            "player-ui/controls.js",
+            "com/nuvio/app/features/player/desktop/cast/DesktopCastManager.class"
+          )
+          foreach ($entry in $requiredEntries) {
+            if ($jarEntries -notcontains $entry) {
+              throw "The extracted MSI application is missing $entry"
+            }
+          }
+          Get-Item $msi.FullName | Format-List Name, Length, LastWriteTime
+          "MSI_PATH=$($msi.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload MSI
+        uses: actions/upload-artifact@v7
+        with:
+          name: nuvio-desktop-windows-x64-test-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ env.MSI_PATH }}
+          if-no-files-found: error
+          retention-days: 7
+
+      # Runs after the upload so a test failure still leaves an installable MSI.
+      - name: Run Chromecast unit tests
+        shell: pwsh
+        run: |
+          & .\gradlew.bat `
+            :composeApp:desktopTest `
+            --tests "com.nuvio.app.features.player.desktop.cast.*" `
+            "-Pnuvio.webview2.dir=$env:WEBVIEW2_ROOT" `
+            --no-configuration-cache `
+            --no-daemon
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
