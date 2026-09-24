@@ -129,6 +129,90 @@ class CastTranscoderTest {
     }
 
     @Test
+    fun `probe lists subtitle streams with language, codec and title`() {
+        val output = """
+            Input #0, matroska,webm, from 'film.mkv':
+              Duration: 00:42:00.00, start: 0.000000, bitrate: 8000 kb/s
+              Stream #0:0: Video: h264 (High), yuv420p(progressive), 1920x1080, 23.98 fps
+              Stream #0:1(eng): Audio: aac (LC), 48000 Hz, stereo, fltp (default)
+              Stream #0:2(eng): Subtitle: subrip (srt) (default)
+                Metadata:
+                  title           : English
+              Stream #0:3(eng): Subtitle: hdmv_pgs_subtitle (pgssub), 1920x1080
+                Metadata:
+                  title           : English SDH
+              Stream #0:4: Subtitle: ass (ssa)
+              Stream #0:5[0x6](fre): Subtitle: mov_text (tx3g / 0x67337874)
+        """.trimIndent()
+
+        val streams = CastTranscoder.parseProbe(output)!!.subtitleStreams
+
+        assertEquals(
+            listOf(
+                CastSubtitleStream(0, "subrip", "eng", "English"),
+                CastSubtitleStream(1, "hdmv_pgs_subtitle", "eng", "English SDH"),
+                CastSubtitleStream(2, "ass", null, null),
+                CastSubtitleStream(3, "mov_text", "fre", null),
+            ),
+            streams,
+        )
+        assertFalse(streams[0].isBitmap)
+        assertTrue(streams[1].isBitmap)
+    }
+
+    @Test
+    fun `picture subtitles are overlaid in the same pass`() {
+        val args = CastTranscoder.buildArguments(
+            "ffmpeg",
+            CastTranscodeSpec(
+                inputUrl = "film.mkv",
+                headers = emptyMap(),
+                startMs = 0L,
+                audioTrackIndex = 1,
+                videoCodec = "hevc",
+                overlaySubtitleStream = 2,
+            ),
+        )
+
+        val graph = args[args.indexOf("-filter_complex") + 1]
+        assertTrue(graph.startsWith("[0:v:0][0:s:2]overlay"), graph)
+        assertTrue(graph.endsWith("format=yuv420p[v]"), graph)
+        assertTrue(args.containsSequence("-map", "[v]"))
+        assertFalse(args.containsSequence("-map", "0:v:0"))
+        assertTrue(args.containsSequence("-map", "0:a:1"))
+        assertTrue(args.containsSequence("-c:v", SOFTWARE_H264_ENCODER))
+        assertFalse("-vf" in args)
+        assertFalse("-tag:v" in args)
+    }
+
+    @Test
+    fun `text subtitles are extracted as SubRip with source timestamps`() {
+        val args = CastTranscoder.extractSubtitlesArguments(
+            "ffmpeg",
+            "https://debrid.example/dl/abc",
+            mapOf("Referer" to "https://addon.example/"),
+            streamIndex = 3,
+            fromMs = 600_000L,
+            output = java.io.File("/tmp/out.srt"),
+        )
+
+        assertTrue(args.indexOf("-ss") < args.indexOf("-i"))
+        assertEquals("600.000", args[args.indexOf("-ss") + 1])
+        assertTrue("-copyts" in args)
+        assertTrue(args.containsSequence("-map", "0:s:3"))
+        assertTrue(args.containsSequence("-c:s", "srt"))
+        assertTrue(args.containsSequence("-flush_packets", "1"))
+        assertTrue("-headers" in args)
+        assertEquals(java.io.File("/tmp/out.srt").absolutePath, args.last())
+        // Progress comes from the last cue written so far.
+        assertEquals(
+            3_723_450L,
+            CastTranscoder.lastCueStartMs("1\n00:00:01,000 --> 00:00:02,000\nA\n\n2\n01:02:03,450 --> 01:02:05,000\nB\n"),
+        )
+        assertEquals(null, CastTranscoder.lastCueStartMs(""))
+    }
+
+    @Test
     fun `first packet time is read from framecrc output`() {
         val output = """
             #extradata 0:       48, 0x84ad115e

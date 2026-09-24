@@ -27,6 +27,7 @@ import com.nuvio.app.features.player.inferForcedSubtitleTrack
 import com.nuvio.app.features.player.toStorageHexString
 import com.nuvio.app.features.player.desktop.cast.CastConnectionState
 import com.nuvio.app.features.player.desktop.cast.CastMediaSource
+import com.nuvio.app.features.player.desktop.cast.CastPhase
 import com.nuvio.app.features.player.desktop.cast.CastPlayerState
 import com.nuvio.app.features.player.desktop.cast.CastSubtitleSelection
 import com.nuvio.app.features.player.desktop.cast.CastTextTrackStyle
@@ -122,6 +123,8 @@ internal class NativePlayerController(
     private var castSessionToken = 0L
     private var castSubtitleUrl: String? = null
     private var castEmbeddedSubtitleIndex = -1
+    /** The receiver's play state last handed to the screen, so TV-side play/pause shows up there too. */
+    private var castSyncedPlayback: Boolean? = null
     private val castListener: () -> Unit = { SwingUtilities.invokeLater { refreshCastControls() } }
 
     private val isCasting: Boolean
@@ -1200,8 +1203,21 @@ internal class NativePlayerController(
 
     private fun refreshCastControls() {
         if (releaseRequested) return
+        syncCastPlaybackToScreen()
         lastSentControlsStructureKey = null
         updateControls(controlsState)
+    }
+
+    /**
+     * Keeps the screen's play state (pause overlay, scrobbling, the play button) in step with
+     * the receiver, including play/pause pressed on the TV remote or in Google Home.
+     */
+    private fun syncCastPlaybackToScreen() {
+        val ui = DesktopCastManager.state
+        if (!castOwner || ui.connectionState == CastConnectionState.Idle) return
+        if (ui.wantsPlayback == castSyncedPlayback) return
+        castSyncedPlayback = ui.wantsPlayback
+        onEvent("setPlaybackStateQuiet", if (ui.wantsPlayback) 1.0 else 0.0)
     }
 
     private fun startCasting(deviceIndex: Int) {
@@ -1217,16 +1233,12 @@ internal class NativePlayerController(
             current != 0L -> runCatching { NativePlayerBridge.positionMs(current) }.getOrDefault(pending.initialPositionMs)
             else -> pending.initialPositionMs
         }
-        val paused = if (castStatus != null) {
-            castStatus.playerState == CastPlayerState.Paused
-        } else {
-            current != 0L && runCatching {
-                NativePlayerBridge.isPaused(current) && !NativePlayerBridge.isLoading(current)
-            }.getOrDefault(false)
-        }
-        log.d { "startCasting device=${device.name} positionMs=$positionMs paused=$paused" }
+        // Casting always starts playing on the TV: picking a device is the request to watch there,
+        // even when the local player was paused or still loading.
+        log.d { "startCasting device=${device.name} positionMs=$positionMs" }
         val token = ++castSessionToken
         castOwner = true
+        castSyncedPlayback = null
         castSourceUrl = pending.sourceUrl
         if (current != 0L) NativePlayerBridge.setPaused(current, true)
         DesktopCastManager.connect(
@@ -1234,7 +1246,7 @@ internal class NativePlayerController(
             media = castMediaFor(pending),
             subtitles = castSubtitleSelection(),
             positionMs = positionMs,
-            autoplay = !paused,
+            autoplay = true,
             onEnded = { endedAtMs, wasPlaying, _ ->
                 SwingUtilities.invokeLater { onCastEnded(token, endedAtMs, wasPlaying) }
             },
@@ -1247,6 +1259,7 @@ internal class NativePlayerController(
         // A session replaced by a newer one (device switch) must not hand playback back.
         if (!castOwner || token != castSessionToken) return
         castOwner = false
+        castSyncedPlayback = null
         log.d { "cast ended positionMs=$positionMs wasPlaying=$wasPlaying handle=$handle" }
         if (releaseRequested) return
         handle.takeIf { it != 0L }?.let { current ->
@@ -1307,6 +1320,7 @@ internal class NativePlayerController(
             externalUrl = castSubtitleUrl,
             externalName = addon?.let { it.languageLabel.ifBlank { it.display } },
             externalLanguage = addon?.language?.takeIf(String::isNotBlank),
+            embeddedIndex = castEmbeddedSubtitleIndex.takeIf { castSubtitleUrl == null && it >= 0 },
             embeddedLanguage = embedded?.language,
             embeddedName = embedded?.label,
             delayMs = pendingSubtitleDelayMs ?: 0,
@@ -1316,7 +1330,8 @@ internal class NativePlayerController(
 
     private fun castSnapshot(): PlayerPlaybackSnapshot {
         val status = DesktopCastManager.currentStatus() ?: return PlayerPlaybackSnapshot(isLoading = true)
-        val connecting = DesktopCastManager.state.connectionState == CastConnectionState.Connecting
+        val ui = DesktopCastManager.state
+        val connecting = ui.connectionState == CastConnectionState.Connecting || ui.phase in CAST_STEP_PHASES
         return PlayerPlaybackSnapshot(
             isLoading = connecting ||
                 status.playerState == CastPlayerState.Loading ||
@@ -1335,13 +1350,14 @@ internal class NativePlayerController(
         val ui = DesktopCastManager.state
         val owner = castOwner && ui.connectionState != CastConnectionState.Idle
         val status = if (owner) DesktopCastManager.currentStatus() else null
+        val deviceName = if (owner) ui.activeDevice?.name.orEmpty() else ""
         return CastControlsSnapshot(
             state = when {
                 !owner -> "idle"
                 ui.connectionState == CastConnectionState.Connected -> "connected"
                 else -> "connecting"
             },
-            deviceName = if (owner) ui.activeDevice?.name.orEmpty() else "",
+            deviceName = deviceName,
             discovering = ui.isDiscovering,
             devices = ui.devices.mapIndexed { index, device ->
                 CastControlsDevice(
@@ -1353,14 +1369,23 @@ internal class NativePlayerController(
             },
             positionMs = status?.positionMs ?: 0L,
             durationMs = status?.durationMs ?: 0L,
-            isPlaying = status?.playerState == CastPlayerState.Playing,
+            // What the receiver is meant to be doing: buffering after "play" still shows pause.
+            isPlaying = owner && ui.wantsPlayback,
             isLoading = owner && (
                 ui.connectionState == CastConnectionState.Connecting ||
+                    ui.phase in CAST_STEP_PHASES ||
                     status?.playerState == CastPlayerState.Loading ||
                     status?.playerState == CastPlayerState.Buffering
                 ),
             errorMessage = ui.errorMessage.orEmpty(),
             errorToken = ui.errorToken,
+            phase = if (owner) ui.phase.name.lowercase() else "idle",
+            phaseLabel = if (owner) castPhaseLabel(ui.phase, ui.phaseDetail, deviceName) else "",
+            videoInfo = if (owner) ui.videoInfo else "",
+            audioInfo = if (owner) ui.audioInfo else "",
+            subtitleInfo = if (owner) ui.subtitleInfo else "",
+            subtitleProgress = if (owner) ui.subtitleProgress else null,
+            volumeLevel = status?.volumeLevel?.let { level -> if (status.muted) 0f else level },
         )
     }
 
@@ -1517,7 +1542,31 @@ private data class CastControlsSnapshot(
     val isLoading: Boolean = false,
     val errorMessage: String = "",
     val errorToken: Long = 0L,
+    val phase: String = "idle",
+    val phaseLabel: String = "",
+    val videoInfo: String = "",
+    val audioInfo: String = "",
+    val subtitleInfo: String = "",
+    val subtitleProgress: Float? = null,
+    /** The TV's own volume, which the volume slider controls while casting. */
+    val volumeLevel: Float? = null,
 )
+
+/** Steps of starting or restoring a cast, shown as loading. */
+private val CAST_STEP_PHASES = setOf(CastPhase.Connecting, CastPhase.Preparing, CastPhase.Loading, CastPhase.Reconnecting)
+
+/** One line saying where casting is at, e.g. "Buffering on Living Room TV…". */
+private fun castPhaseLabel(phase: CastPhase, detail: String?, deviceName: String): String = when (phase) {
+    CastPhase.Idle -> ""
+    CastPhase.Connecting -> "Connecting to $deviceName…"
+    CastPhase.Preparing -> "${detail ?: "Getting the stream ready"}…"
+    CastPhase.Loading -> "Loading on $deviceName…"
+    CastPhase.Buffering -> "Buffering on $deviceName…"
+    CastPhase.Playing -> "Playing on $deviceName"
+    CastPhase.Paused -> "Paused on $deviceName"
+    CastPhase.Finished -> "Finished on $deviceName"
+    CastPhase.Reconnecting -> "${detail ?: "Reconnecting to $deviceName"}…"
+}
 
 private fun SubtitleStyleState.toCastTextTrackStyle(): CastTextTrackStyle =
     CastTextTrackStyle(
@@ -1563,6 +1612,20 @@ private fun StringBuilder.appendCastJson(cast: CastControlsSnapshot) {
     appendJsonField("castErrorMessage", cast.errorMessage)
     append(',')
     appendJsonField("castErrorToken", cast.errorToken)
+    append(',')
+    appendJsonField("castPhase", cast.phase)
+    append(',')
+    appendJsonField("castPhaseLabel", cast.phaseLabel)
+    append(',')
+    appendJsonField("castVideoInfo", cast.videoInfo)
+    append(',')
+    appendJsonField("castAudioInfo", cast.audioInfo)
+    append(',')
+    appendJsonField("castSubtitleInfo", cast.subtitleInfo)
+    append(',')
+    appendJsonField("castSubtitleProgress", cast.subtitleProgress)
+    append(',')
+    appendJsonField("castVolumeLevel", cast.volumeLevel)
 }
 
 private fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, cast: CastControlsSnapshot): String =

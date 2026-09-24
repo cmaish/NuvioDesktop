@@ -35,16 +35,29 @@ internal data class CastSubtitleSelection(
     val externalUrl: String? = null,
     val externalName: String? = null,
     val externalLanguage: String? = null,
-    /** Built-in track picked in the local player; matched against the receiver's own tracks. */
+    /** Built-in track picked in the local player: its position among the player's subtitle tracks. */
+    val embeddedIndex: Int? = null,
     val embeddedLanguage: String? = null,
     val embeddedName: String? = null,
     val delayMs: Int = 0,
     val style: CastTextTrackStyle? = null,
 ) {
-    val isOff: Boolean get() = externalUrl == null && embeddedLanguage == null && embeddedName == null
+    val isOff: Boolean get() = externalUrl == null && embeddedIndex == null && embeddedLanguage == null && embeddedName == null
+
+    val isEmbedded: Boolean get() = externalUrl == null && !isOff
+
+    /** A short name for the on-screen status, e.g. "English". */
+    val displayName: String
+        get() = when {
+            externalUrl != null -> externalName?.takeIf(String::isNotBlank) ?: externalLanguage?.takeIf(String::isNotBlank) ?: "Subtitles"
+            else -> embeddedName?.takeIf(String::isNotBlank) ?: embeddedLanguage?.takeIf(String::isNotBlank) ?: "Built-in subtitles"
+        }
 }
 
 internal enum class CastConnectionState { Idle, Connecting, Connected }
+
+/** Where casting is at, for the on-screen status. */
+internal enum class CastPhase { Idle, Connecting, Preparing, Loading, Buffering, Playing, Paused, Finished, Reconnecting }
 
 internal data class CastUiState(
     val isDiscovering: Boolean = false,
@@ -54,6 +67,17 @@ internal data class CastUiState(
     val status: CastMediaStatus? = null,
     val errorMessage: String? = null,
     val errorToken: Long = 0L,
+    val phase: CastPhase = CastPhase.Idle,
+    /** What is being prepared or retried, shown under the phase ("Getting subtitles ready"). */
+    val phaseDetail: String? = null,
+    /** How the video, audio and subtitles reach the TV, e.g. "DTS → stereo AAC". */
+    val videoInfo: String = "",
+    val audioInfo: String = "",
+    val subtitleInfo: String = "",
+    /** 0..1 while built-in subtitles are being read for burning in, otherwise null. */
+    val subtitleProgress: Float? = null,
+    /** Whether the receiver is (or is about to be) playing, as opposed to paused or stopped. */
+    val wantsPlayback: Boolean = false,
 )
 
 /**
@@ -105,11 +129,39 @@ internal object DesktopCastManager {
     @Volatile private var streamOffsetMs = 0L
     @Volatile private var convertedDurationMs = 0L
     /** Subtitle drawn into the converted video, or null when none is burned in. */
-    @Volatile private var burnedSubtitleKey: Pair<Triple<String?, Int, String?>, CastTextTrackStyle?>? = null
+    @Volatile private var burnedSubtitleKey: BurnKey? = null
     @Volatile private var burnNoticeKey: String? = null
     @Volatile private var burnFile: File? = null
     @Volatile private var sideLoadActivationNudged = false
     @Volatile private var sessionEndedListener: ((positionMs: Long, wasPlaying: Boolean, reason: String?) -> Unit)? = null
+    /** Built-in text subtitles being read for burning in; one at a time, for the current media. */
+    @Volatile private var extraction: SubtitleExtraction? = null
+    /** Last position the receiver reported while playing or paused, on the source's timeline. */
+    @Volatile private var lastGoodPositionMs = 0L
+    /** Whether the current load has played at all; a stream that never started is not retried. */
+    @Volatile private var loadReachedPlayback = false
+    @Volatile private var recoveryAttempts = 0
+    @Volatile private var recoveredAtPositionMs = -1L
+    /** The load being recovered from, so repeated "finished" reports for it start one reload. */
+    @Volatile private var recoveryLoad = -1L
+    /** When the last play/pause/load was sent; receiver reports right after it may still be stale. */
+    @Volatile private var lastCommandAtMs = 0L
+    /** Pause pressed before the receiver was ready; applied once the media is loaded. */
+    @Volatile private var pauseRequestedWhileConnecting = false
+
+    private data class BurnKey(val source: String, val delayMs: Int, val style: CastTextTrackStyle?)
+
+    private class SubtitleExtraction(
+        val key: String,
+        val fromMs: Long,
+        val file: File,
+        val durationMs: Long,
+    ) {
+        @Volatile var progressMs = 0L
+        @Volatile var done = false
+        @Volatile var failed = false
+        @Volatile var cancelled = false
+    }
 
     val isCasting: Boolean
         get() = state.connectionState != CastConnectionState.Idle
@@ -164,32 +216,45 @@ internal object DesktopCastManager {
             stopCasting()
         }
         val connectGeneration = ++generation
+        pauseRequestedWhileConnecting = false
         sessionEndedListener = onEnded
         currentMedia = media
         currentSubtitles = subtitles
+        lastGoodPositionMs = positionMs
+        recoveryAttempts = 0
         update {
             it.copy(
                 connectionState = CastConnectionState.Connecting,
                 activeDevice = device,
                 status = CastMediaStatus(positionMs = positionMs),
                 errorMessage = null,
+                phase = CastPhase.Connecting,
+                phaseDetail = null,
+                videoInfo = "",
+                audioInfo = "",
+                subtitleInfo = "",
+                subtitleProgress = null,
+                wantsPlayback = autoplay,
             )
         }
         worker.execute {
             if (generation != connectGeneration) return@execute
-            lateinit var created: CastSession
-            created = CastSession(
-                device = device,
-                onStatus = ::onSessionStatus,
-                onEnded = { reason -> onSessionEnded(ended = created, reason = reason, expected = false) },
-            )
+            val created = newSession(device)
             try {
                 session = created
                 created.start()
-                loadMedia(created, media, subtitles, positionMs, autoplay)
                 if (generation != connectGeneration) {
                     created.stop()
                     return@execute
+                }
+                loadMedia(created, media, subtitles, positionMs, autoplay && !pauseRequestedWhileConnecting)
+                if (generation != connectGeneration) {
+                    created.stop()
+                    return@execute
+                }
+                if (pauseRequestedWhileConnecting) {
+                    created.pause()
+                    update { it.copy(wantsPlayback = false) }
                 }
                 update { it.copy(connectionState = CastConnectionState.Connected) }
                 // Subtitle changes made while connecting were not applied yet.
@@ -206,12 +271,69 @@ internal object DesktopCastManager {
         }
     }
 
+    private fun newSession(device: CastDevice): CastSession {
+        lateinit var created: CastSession
+        created = CastSession(
+            device = device,
+            onStatus = { status -> if (session === created) onSessionStatus(status) },
+            onEnded = { reason, connectionLost ->
+                if (connectionLost && state.connectionState == CastConnectionState.Connected) {
+                    reconnect(created, reason)
+                } else {
+                    onSessionEnded(ended = created, reason = reason, expected = false)
+                }
+            },
+        )
+        return created
+    }
+
+    /**
+     * The connection to the TV dropped (Wi-Fi hiccup, TV busy). The receiver usually keeps
+     * playing, so rejoin its session rather than handing playback back to this computer.
+     */
+    private fun reconnect(lost: CastSession, reason: String?) {
+        if (session !== lost) return
+        val reconnectGeneration = generation
+        val device = lost.device
+        val lastStatus = sourceStatus(lost)
+        update { it.copy(phase = CastPhase.Reconnecting, phaseDetail = "Lost the connection to ${device.name}") }
+        worker.execute {
+            for (attempt in 1..RECONNECT_ATTEMPTS) {
+                if (generation != reconnectGeneration || session !== lost) return@execute
+                runCatching { Thread.sleep(RECONNECT_DELAY_MS * attempt) }
+                val created = newSession(device)
+                val joined = runCatching {
+                    created.start(joinExisting = true)
+                    session = created
+                    if (created.refreshMediaStatus() == null) {
+                        // The receiver app restarted or dropped the media: load it again.
+                        val media = currentMedia ?: error("Nothing to cast")
+                        loadMedia(created, media, currentSubtitles, lastStatus.positionMs, state.wantsPlayback)
+                    }
+                }.onFailure { error ->
+                    log.w(error) { "reconnecting to ${device.name} failed (attempt $attempt)" }
+                    if (session === created) session = lost
+                    created.disconnect()
+                }.isSuccess
+                if (joined) {
+                    log.d { "reconnected to ${device.name}" }
+                    update { it.copy(phase = phaseFor(created.status()), phaseDetail = null) }
+                    return@execute
+                }
+            }
+            onSessionEnded(ended = lost, reason = reason ?: "Lost the connection to ${device.name}", expected = false, lastStatus = lastStatus)
+        }
+    }
+
     /** Replaces what the receiver plays, e.g. after the user picked another source or episode. */
     fun changeMedia(media: CastMediaSource, subtitles: CastSubtitleSelection, positionMs: Long) {
         currentMedia = media
         currentSubtitles = subtitles
+        cancelExtraction()
         val active = session ?: return
         worker.execute {
+            lastGoodPositionMs = positionMs
+            recoveryAttempts = 0
             runCatching { loadMedia(active, media, subtitles, positionMs, autoplay = true) }
                 .onFailure { error -> reportError(error.message ?: "Could not cast this stream") }
         }
@@ -225,11 +347,13 @@ internal object DesktopCastManager {
         val media = currentMedia ?: return
         worker.execute {
             if (state.connectionState != CastConnectionState.Connected) return@execute
+            val canBurn = transcoder.isAvailable
+            val wanted = if (canBurn) subtitles.burnKey() else null
             val reload = when {
                 // Burned-in subtitles are part of the picture: any change (including turning
                 // them off) means re-encoding from the current position.
-                burnedSubtitleKey != null -> subtitles.burnKey() != burnedSubtitleKey
-                subtitles.externalUrl != null && transcoder.isAvailable -> true
+                burnedSubtitleKey != null -> wanted != burnedSubtitleKey
+                wanted != null -> true
                 subtitles.externalUrl != null -> subtitles.sideLoadKey() != loadedSubtitleKey
                 else -> false
             }
@@ -238,17 +362,15 @@ internal object DesktopCastManager {
                     // Side-loaded and burned-in subtitles can only change by (re)loading the media.
                     val status = sourceStatus(active)
                     runCatching {
-                        loadMedia(
-                            active,
-                            media,
-                            subtitles,
-                            status.positionMs,
-                            autoplay = status.playerState != CastPlayerState.Paused,
-                        )
+                        loadMedia(active, media, subtitles, status.positionMs, autoplay = state.wantsPlayback)
                     }.onFailure { error -> reportError(error.message ?: "Could not update subtitles") }
                 }
                 subtitles.externalUrl != null -> active.setActiveTextTracks(listOf(SIDE_LOADED_TRACK_ID), subtitles.style)
-                subtitles.isOff -> active.setActiveTextTracks(emptyList(), subtitles.style)
+                subtitles.isOff -> {
+                    cancelExtraction()
+                    active.setActiveTextTracks(emptyList(), subtitles.style)
+                    update { it.copy(subtitleInfo = "Off", subtitleProgress = null) }
+                }
                 else -> {
                     pendingEmbeddedMatch = true
                     applyEmbeddedMatch(active, active.status())
@@ -271,7 +393,7 @@ internal object DesktopCastManager {
                 // ffmpeg picks the track; restart the stream with the new one.
                 val status = sourceStatus(active)
                 runCatching {
-                    loadMedia(active, updated, currentSubtitles, status.positionMs, status.playerState != CastPlayerState.Paused)
+                    loadMedia(active, updated, currentSubtitles, status.positionMs, state.wantsPlayback)
                 }.onFailure { error -> reportError(error.message ?: "Could not switch the audio track") }
                 return@withSession
             }
@@ -286,9 +408,24 @@ internal object DesktopCastManager {
         }
     }
 
-    fun play() = withSession { it.play() }
+    fun play() {
+        if (session == null) return
+        pauseRequestedWhileConnecting = false
+        noteCommand(wantsPlayback = true)
+        withSession { it.play() }
+    }
 
-    fun pause() = withSession { it.pause() }
+    fun pause() {
+        if (session == null) return
+        if (state.connectionState == CastConnectionState.Connecting) pauseRequestedWhileConnecting = true
+        noteCommand(wantsPlayback = false)
+        withSession { it.pause() }
+    }
+
+    private fun noteCommand(wantsPlayback: Boolean) {
+        lastCommandAtMs = System.currentTimeMillis()
+        if (state.wantsPlayback != wantsPlayback) update { it.copy(wantsPlayback = wantsPlayback) }
+    }
 
     fun seekTo(positionMs: Long) = withSession { active -> seekOn(active, positionMs) }
 
@@ -300,13 +437,13 @@ internal object DesktopCastManager {
 
     /** Runs on the worker. A converted stream can't seek, so it restarts ffmpeg from [positionMs]. */
     private fun seekOn(active: CastSession, positionMs: Long) {
+        lastGoodPositionMs = positionMs
         if (!isConverting) {
             active.seekTo(positionMs)
             return
         }
         val media = currentMedia ?: return
-        val paused = active.status().playerState == CastPlayerState.Paused
-        runCatching { loadMedia(active, media, currentSubtitles, positionMs, autoplay = !paused) }
+        runCatching { loadMedia(active, media, currentSubtitles, positionMs, autoplay = state.wantsPlayback) }
             .onFailure { error -> reportError(error.message ?: "Could not seek on ${active.device.name}") }
     }
 
@@ -347,7 +484,28 @@ internal object DesktopCastManager {
         worker.execute { runCatching { block(active) }.onFailure { error -> log.w(error) { "cast command failed" } } }
     }
 
+    private fun setPhase(phase: CastPhase, detail: String? = null) {
+        update { it.copy(phase = phase, phaseDetail = detail) }
+    }
+
     private fun loadMedia(
+        active: CastSession,
+        media: CastMediaSource,
+        subtitles: CastSubtitleSelection,
+        positionMs: Long,
+        autoplay: Boolean,
+    ) {
+        try {
+            loadMediaSteps(active, media, subtitles, positionMs, autoplay)
+        } finally {
+            // A failed step must not leave "Preparing" on screen.
+            if (state.phase == CastPhase.Preparing || state.phase == CastPhase.Reconnecting) {
+                update { it.copy(phase = phaseFor(active.status()), phaseDetail = null) }
+            }
+        }
+    }
+
+    private fun loadMediaSteps(
         active: CastSession,
         media: CastMediaSource,
         subtitles: CastSubtitleSelection,
@@ -357,29 +515,65 @@ internal object DesktopCastManager {
         val host = active.device.host
         // Whatever was converting for the previous media or position is no longer wanted.
         mediaServer.stopProcessStreams()
+        lastCommandAtMs = System.currentTimeMillis()
+        update { it.copy(wantsPlayback = autoplay) }
         val needsConversion = CastTranscoder.needsAudioConversion(media.audioTrackLabel)
         val canConvert = transcoder.isAvailable
+        val input = localPathOrUrl(media.url)
+        if (!subtitles.isEmbedded) cancelExtraction()
+        setPhase(CastPhase.Preparing, "Checking the stream")
+        val probe by lazy {
+            probes.getOrPut(media.url) {
+                transcoder.probe(input, media.headers) ?: CastMediaProbe(durationMs = 0L, videoCodec = null)
+            }
+        }
+        // Built-in subtitles, when ffmpeg can draw them into the picture. Adaptive streams
+        // (HLS/DASH) list their own subtitle tracks, which the receiver shows itself.
+        val embedded = subtitles.takeIf { it.isEmbedded && canConvert && !isAdaptive(media.url) }?.let { selection ->
+            setPhase(CastPhase.Preparing, "Getting subtitles ready")
+            EmbeddedPlan.resolve(selection, probe.subtitleStreams)
+        }
+        var embeddedVtt: String? = null
+        var embeddedPending: CastSubtitleStream? = null
+        if (embedded is EmbeddedPlan.Text) {
+            val ready = awaitExtraction(media, input, embedded.stream, positionMs, maxOf(media.durationMs, probe.durationMs))
+            if (ready != null) {
+                embeddedVtt = runCatching {
+                    CastSubtitleConverter.toWebVtt(ready.readText(), ready.name, subtitles.delayMs - positionMs.toInt(), plainText = true)
+                }.getOrNull()
+                if (embeddedVtt == null) reportError("The built-in subtitles have no lines to show.")
+            } else if (extraction?.failed != true) {
+                embeddedPending = embedded.stream
+            }
+        }
+        if (embedded is EmbeddedPlan.Unmatched) {
+            reportError("Couldn't find that built-in subtitle track to show on ${active.device.name}. Try another subtitle.")
+        }
         // A subtitle enabled in the player is drawn into the picture when ffmpeg is available:
         // the receiver then only has to play video. Re-encoded video starts exactly at
         // positionMs, so the cues are shifted by that much.
-        val burnVtt = subtitles.externalUrl?.takeIf { canConvert }?.let { url ->
-            runCatching { loadSubtitleVtt(url, subtitles.delayMs - positionMs.toInt()) ?: error("No subtitle lines could be read") }
+        val externalVtt = subtitles.externalUrl?.takeIf { canConvert }?.let { url ->
+            setPhase(CastPhase.Preparing, "Getting subtitles ready")
+            runCatching {
+                loadSubtitleVtt(url, subtitles.delayMs - positionMs.toInt(), plainText = true) ?: error("No subtitle lines could be read")
+            }
                 .onFailure { error ->
                     log.w(error) { "could not prepare subtitle for burning in" }
                     reportError("Couldn't load the selected subtitles for casting.")
                 }
                 .getOrNull()
         }
-        val burn = burnVtt != null
+        val burnVtt = externalVtt ?: embeddedVtt
+        val overlayStream = (embedded as? EmbeddedPlan.Bitmap)?.stream
+        val burn = burnVtt != null || overlayStream != null
         val convert = canConvert && (burn || needsConversion)
         val contentUrl: String
         val contentType: String
         val receiverStartMs: Long
+        var encoder: String? = null
         if (convert) {
-            val input = localPathOrUrl(media.url)
-            val probe = probes.getOrPut(media.url) {
-                transcoder.probe(input, media.headers) ?: CastMediaProbe(durationMs = 0L, videoCodec = null)
-            }
+            setPhase(CastPhase.Preparing, if (burn) "Starting the video conversion" else "Starting the audio conversion")
+            encoder = if (burn) transcoder.videoEncoder() else null
             val spec = CastTranscodeSpec(
                 inputUrl = input,
                 headers = media.headers,
@@ -388,7 +582,8 @@ internal object DesktopCastManager {
                 videoCodec = probe.videoCodec,
                 burnSubtitlesFile = burnVtt?.let(::writeBurnSubtitle),
                 subtitleStyle = subtitles.style,
-                videoEncoder = if (burn) transcoder.videoEncoder() else SOFTWARE_H264_ENCODER,
+                overlaySubtitleStream = overlayStream?.index,
+                videoEncoder = encoder ?: SOFTWARE_H264_ENCODER,
             )
             // The receiver's zero is where ffmpeg starts: exactly positionMs when re-encoding,
             // the keyframe before it when copying the video.
@@ -417,6 +612,7 @@ internal object DesktopCastManager {
         val subtitleShiftMs = subtitles.delayMs - streamOffsetMs.toInt()
         // With ffmpeg available subtitles are always burned in; a failed burn would fail here too.
         val sideLoaded = subtitles.externalUrl?.takeIf { !canConvert }?.let { url ->
+            setPhase(CastPhase.Preparing, "Getting subtitles ready")
             runCatching { loadSubtitleVtt(url, subtitleShiftMs) ?: error("No subtitle lines could be read") }
                 .onFailure { error ->
                     log.w(error) { "could not prepare subtitle for cast" }
@@ -434,13 +630,24 @@ internal object DesktopCastManager {
         }
         hasSideLoadedTrack = sideLoaded != null
         loadedSubtitleKey = if (sideLoaded != null) subtitles.sideLoadKey() else null
-        pendingEmbeddedMatch = !burn && sideLoaded == null && subtitles.externalUrl == null && !subtitles.isOff
+        // Without ffmpeg (or for HLS/DASH), built-in subtitles are matched against the receiver's own tracks.
+        pendingEmbeddedMatch = subtitles.isEmbedded && embedded == null
         // When converting, ffmpeg already picked the audio track.
         pendingAudioTrackIndex = if (convert) 0 else media.audioTrackIndex
         val thisLoad = ++loadGeneration
+        loadReachedPlayback = false
+        update {
+            it.copy(
+                videoInfo = describeVideo(convert, burn, encoder),
+                audioInfo = describeAudio(media.audioTrackLabel, convert, needsConversion),
+                subtitleInfo = describeSubtitles(subtitles, burn, sideLoaded != null, embeddedPending != null, embedded),
+                subtitleProgress = if (embeddedPending != null) extractionProgress() else null,
+            )
+        }
+        setPhase(CastPhase.Loading)
         log.d {
-            "cast load contentType=$contentType convert=$convert burn=$burn offsetMs=$streamOffsetMs " +
-                "subtitles=${sideLoaded != null} audio=${media.audioTrackLabel}"
+            "cast load contentType=$contentType convert=$convert burn=$burn overlay=${overlayStream?.index} " +
+                "offsetMs=$streamOffsetMs subtitles=${sideLoaded != null} audio=${media.audioTrackLabel}"
         }
         active.load(
             CastLoadRequest(
@@ -456,7 +663,8 @@ internal object DesktopCastManager {
                 textTrackStyle = subtitles.style,
             ),
         )
-        val noticeKey = "${media.url}|${subtitles.externalUrl}"
+        update { it.copy(phase = phaseFor(active.status()), phaseDetail = null) }
+        val noticeKey = "${media.url}|${subtitles.burnKey()?.source}"
         if (burn && noticeKey != burnNoticeKey) {
             burnNoticeKey = noticeKey
             audioWarningKey = "${media.url}|${media.audioTrackLabel}"
@@ -485,6 +693,142 @@ internal object DesktopCastManager {
                 }
             }, SUBTITLE_FETCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         }
+    }
+
+    /** How a built-in subtitle track can be shown on the TV. */
+    private sealed interface EmbeddedPlan {
+        /** Picture subtitles: overlaid while re-encoding. */
+        data class Bitmap(val stream: CastSubtitleStream) : EmbeddedPlan
+        /** Text subtitles: read out of the file first, then burned in like an addon subtitle. */
+        data class Text(val stream: CastSubtitleStream) : EmbeddedPlan
+        data object Unmatched : EmbeddedPlan
+
+        companion object {
+            fun resolve(selection: CastSubtitleSelection, streams: List<CastSubtitleStream>): EmbeddedPlan {
+                val stream = matchEmbeddedStream(selection, streams) ?: return Unmatched
+                return if (stream.isBitmap) Bitmap(stream) else Text(stream)
+            }
+        }
+    }
+
+    /**
+     * Returns the extracted subtitle file when it is ready, waiting briefly: reading from disk
+     * usually finishes in seconds. Otherwise reading goes on in the background and the stream
+     * is reloaded with the subtitles once they are ready.
+     */
+    private fun awaitExtraction(
+        media: CastMediaSource,
+        input: String,
+        stream: CastSubtitleStream,
+        positionMs: Long,
+        durationMs: Long,
+    ): File? {
+        val key = "${media.url}#${stream.index}"
+        val existing = extraction
+        val job = if (
+            existing != null && existing.key == key && !existing.cancelled && !existing.failed &&
+            existing.fromMs <= positionMs + EXTRACTION_SLACK_MS
+        ) {
+            existing
+        } else {
+            cancelExtraction()
+            startExtraction(key, media, input, stream, positionMs, durationMs)
+        }
+        val deadline = System.currentTimeMillis() + EXTRACTION_WAIT_MS
+        while (!job.done && !job.failed && !job.cancelled && System.currentTimeMillis() < deadline) {
+            Thread.sleep(200)
+        }
+        return job.file.takeIf { job.done }
+    }
+
+    private fun startExtraction(
+        key: String,
+        media: CastMediaSource,
+        input: String,
+        stream: CastSubtitleStream,
+        positionMs: Long,
+        durationMs: Long,
+    ): SubtitleExtraction {
+        val isLocal = !input.startsWith("http://", ignoreCase = true) && !input.startsWith("https://", ignoreCase = true)
+        // A local file is read whole (so seeking back keeps its subtitles); a network stream
+        // only from a little before where casting starts, since it has to be downloaded.
+        val fromMs = if (isLocal) 0L else (positionMs - EXTRACTION_SLACK_MS).coerceAtLeast(0L)
+        val dir = DesktopStorage.rootDir.resolve("cast-subtitles").toFile().apply { mkdirs() }
+        val job = SubtitleExtraction(key, fromMs, File(dir, "embedded-${System.currentTimeMillis()}.srt"), durationMs)
+        extraction = job
+        job.progressMs = fromMs
+        log.d { "reading built-in subtitle stream ${stream.index} (${stream.codec}) from ${fromMs}ms" }
+        Thread({
+            val ok = runCatching {
+                transcoder.extractSubtitles(
+                    inputUrl = input,
+                    headers = media.headers,
+                    streamIndex = stream.index,
+                    fromMs = fromMs,
+                    output = job.file,
+                    onProgress = { reachedMs ->
+                        job.progressMs = reachedMs
+                        if (extraction === job) publishExtractionProgress()
+                    },
+                    isCancelled = { job.cancelled },
+                )
+            }.getOrDefault(false)
+            if (job.cancelled) return@Thread
+            if (ok) job.done = true else job.failed = true
+            worker.execute { onExtractionFinished(job) }
+        }, "nuvio-cast-subtitles").apply {
+            isDaemon = true
+            start()
+        }
+        return job
+    }
+
+    private fun onExtractionFinished(job: SubtitleExtraction) {
+        if (extraction !== job || job.cancelled) return
+        val active = session ?: return
+        val media = currentMedia ?: return
+        if (job.failed) {
+            update { it.copy(subtitleInfo = "${currentSubtitles.displayName} · couldn't be read", subtitleProgress = null) }
+            reportError("Couldn't read the built-in subtitles for casting. Try a subtitle from the Addons tab.")
+            return
+        }
+        // Still wanted, and not shown yet: reload from where the TV is so they appear.
+        val selection = currentSubtitles
+        if (!selection.isEmbedded || burnedSubtitleKey == selection.burnKey()) return
+        if (!job.key.startsWith("${media.url}#")) return
+        val status = sourceStatus(active)
+        log.d { "built-in subtitles ready; reloading at ${status.positionMs}ms" }
+        runCatching { loadMedia(active, media, selection, status.positionMs, state.wantsPlayback) }
+            .onFailure { error -> reportError(error.message ?: "Could not add the subtitles") }
+    }
+
+    private fun extractionProgress(): Float? {
+        val job = extraction ?: return null
+        if (job.done || job.failed) return null
+        val span = job.durationMs - job.fromMs
+        if (span <= 0L) return 0f
+        // Whole percent steps: finer changes would only flood the controls with updates.
+        return (((job.progressMs - job.fromMs).toFloat() / span).coerceIn(0f, 1f) * 100).toInt() / 100f
+    }
+
+    private fun publishExtractionProgress() {
+        if ((extraction?.durationMs ?: 0L) <= 0L) return
+        val progress = extractionProgress() ?: return
+        // Only while the TV is waiting for these subtitles.
+        if (state.subtitleProgress == null || progress == state.subtitleProgress) return
+        update {
+            it.copy(
+                subtitleProgress = progress,
+                subtitleInfo = "${currentSubtitles.displayName} · getting ready ${(progress * 100).toInt()}%",
+            )
+        }
+    }
+
+    private fun cancelExtraction() {
+        val job = extraction ?: return
+        extraction = null
+        job.cancelled = true
+        job.file.delete()
     }
 
     /** Writes the shifted subtitle for ffmpeg's subtitles filter, replacing the previous one. */
@@ -530,7 +874,7 @@ internal object DesktopCastManager {
         return if (needsProxy) mediaServer.publishProxy(receiverHost, url, media.headers) else url
     }
 
-    private fun loadSubtitleVtt(url: String, delayMs: Int): String? {
+    private fun loadSubtitleVtt(url: String, delayMs: Int, plainText: Boolean = false): String? {
         val text = when {
             url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true) -> {
                 val request = Request.Builder().url(url).build()
@@ -542,11 +886,22 @@ internal object DesktopCastManager {
             url.startsWith("file:", ignoreCase = true) -> File(URI(url)).readText()
             else -> File(url).readText()
         }
-        return CastSubtitleConverter.toWebVtt(text, url, delayMs)
+        return CastSubtitleConverter.toWebVtt(text, url, delayMs, plainText)
     }
 
     private fun onSessionStatus(status: CastMediaStatus) {
         val active = session
+        val source = toSourceTimeline(status)
+        if (active != null && recoverIfInterrupted(active, source)) return
+        if (status.playerState == CastPlayerState.Playing || status.playerState == CastPlayerState.Paused) {
+            lastGoodPositionMs = source.positionMs
+            loadReachedPlayback = true
+            // Played well past the last recovery: a later interruption gets fresh retries.
+            if (recoveredAtPositionMs >= 0 && source.positionMs - recoveredAtPositionMs > RECOVERY_RESET_MS) {
+                recoveryAttempts = 0
+                recoveredAtPositionMs = -1L
+            }
+        }
         if (active != null && pendingEmbeddedMatch) {
             worker.execute { applyEmbeddedMatch(active, status) }
         }
@@ -565,8 +920,52 @@ internal object DesktopCastManager {
                 worker.execute { active.setActiveAudioTrack(track.id) }
             }
         }
-        update { it.copy(status = toSourceTimeline(status)) }
+        // Play/pause pressed on the TV or its remote. Reports right after our own commands may
+        // still describe the previous state, so they don't count.
+        val settled = System.currentTimeMillis() - lastCommandAtMs > COMMAND_SETTLE_MS
+        val wantsPlayback = when {
+            !settled -> state.wantsPlayback
+            status.playerState == CastPlayerState.Playing -> true
+            status.playerState == CastPlayerState.Paused -> false
+            status.isEnded -> false
+            else -> state.wantsPlayback
+        }
+        update { current ->
+            current.copy(
+                status = source,
+                // Explicit steps (connecting, preparing a stream) show until they finish.
+                phase = if (current.phase in STEP_PHASES) current.phase else phaseFor(status),
+                wantsPlayback = wantsPlayback,
+            )
+        }
         if (status.isFailed) reportError("${state.activeDevice?.name ?: "The Cast device"} could not play this stream")
+    }
+
+    /**
+     * A stream that stops long before its end (the connection to the source dropped, ffmpeg
+     * lost its input) looks "finished" to the receiver. Pick it up again from where it was
+     * instead of treating the episode as over. Returns true when a reload was started.
+     */
+    private fun recoverIfInterrupted(active: CastSession, source: CastMediaStatus): Boolean {
+        if (!source.isEnded && !source.isFailed) return false
+        // The receiver keeps reporting the stopped media until the reload replaces it.
+        if (recoveryLoad == loadGeneration) return true
+        if (!shouldRecover(source.durationMs.takeIf { it > 0L } ?: convertedDurationMs, lastGoodPositionMs, loadReachedPlayback, recoveryAttempts)) {
+            return false
+        }
+        val media = currentMedia ?: return false
+        recoveryAttempts++
+        recoveryLoad = loadGeneration
+        recoveredAtPositionMs = lastGoodPositionMs
+        val resumeAt = lastGoodPositionMs
+        log.w { "cast stream stopped early at ${resumeAt}ms (${source.idleReason}); resuming (attempt $recoveryAttempts)" }
+        update { it.copy(phase = CastPhase.Reconnecting, phaseDetail = "The stream was interrupted. Picking it up again") }
+        worker.execute {
+            if (session !== active) return@execute
+            runCatching { loadMedia(active, media, currentSubtitles, resumeAt, autoplay = true) }
+                .onFailure { error -> reportError(error.message ?: "Could not resume the stream") }
+        }
+        return true
     }
 
     private fun applyEmbeddedMatch(active: CastSession, status: CastMediaStatus) {
@@ -578,8 +977,9 @@ internal object DesktopCastManager {
             if (mediaStarted) {
                 // The receiver found no text tracks of its own (e.g. subtitles inside an MKV).
                 pendingEmbeddedMatch = false
+                update { it.copy(subtitleInfo = "${currentSubtitles.displayName} · not available on the TV") }
                 reportError(
-                    "Built-in subtitles in this file can't be shown on ${active.device.name}. " +
+                    "Built-in subtitles in this file can't be shown on ${active.device.name} without ffmpeg. " +
                         "Pick a subtitle from the Addons tab instead.",
                 )
             }
@@ -593,7 +993,10 @@ internal object DesktopCastManager {
         } ?: tracks.firstOrNull { track ->
             selection.embeddedName != null && track.name.equals(selection.embeddedName, ignoreCase = true)
         }
-        if (match != null) active.setActiveTextTracks(listOf(match.id), selection.style)
+        if (match != null) {
+            active.setActiveTextTracks(listOf(match.id), selection.style)
+            update { it.copy(subtitleInfo = "${selection.displayName} · TV subtitle track") }
+        }
     }
 
     private fun onSessionEnded(ended: CastSession?, reason: String?, expected: Boolean, lastStatus: CastMediaStatus? = null) {
@@ -603,6 +1006,7 @@ internal object DesktopCastManager {
             if (ended == null && state.connectionState == CastConnectionState.Idle) return
         }
         val status = lastStatus ?: ended?.let(::sourceStatus) ?: state.status
+        val wantedPlayback = state.wantsPlayback
         session = null
         val listener = sessionEndedListener
         sessionEndedListener = null
@@ -617,6 +1021,9 @@ internal object DesktopCastManager {
         convertedDurationMs = 0L
         burnedSubtitleKey = null
         burnNoticeKey = null
+        recoveryAttempts = 0
+        recoveredAtPositionMs = -1L
+        cancelExtraction()
         worker.execute {
             mediaServer.stop()
             burnFile?.delete()
@@ -629,9 +1036,20 @@ internal object DesktopCastManager {
                 status = null,
                 errorMessage = if (expected) current.errorMessage else reason,
                 errorToken = if (!expected && reason != null) current.errorToken + 1 else current.errorToken,
+                phase = CastPhase.Idle,
+                phaseDetail = null,
+                videoInfo = "",
+                audioInfo = "",
+                subtitleInfo = "",
+                subtitleProgress = null,
+                wantsPlayback = false,
             )
         }
-        val wasPlaying = status?.playerState == CastPlayerState.Playing || status?.playerState == CastPlayerState.Buffering
+        val wasPlaying = when (status?.playerState) {
+            CastPlayerState.Playing, CastPlayerState.Buffering -> true
+            CastPlayerState.Paused -> false
+            else -> wantedPlayback && status?.isEnded != true
+        }
         listener?.invoke(status?.positionMs ?: 0L, wasPlaying, if (expected) null else reason)
     }
 
@@ -640,7 +1058,13 @@ internal object DesktopCastManager {
     }
 
     private fun update(transform: (CastUiState) -> CastUiState) {
-        synchronized(this) { state = transform(state) }
+        val changed = synchronized(this) {
+            val next = transform(state)
+            val different = next != state
+            state = next
+            different
+        }
+        if (!changed) return
         val snapshot = synchronized(listeners) { listeners.toList() }
         snapshot.forEach { listener -> runCatching { listener() } }
     }
@@ -648,8 +1072,96 @@ internal object DesktopCastManager {
     private fun CastSubtitleSelection.sideLoadKey(): Triple<String?, Int, String?> =
         Triple(externalUrl, delayMs, externalLanguage)
 
-    private fun CastSubtitleSelection.burnKey(): Pair<Triple<String?, Int, String?>, CastTextTrackStyle?> =
-        sideLoadKey() to style
+    private fun CastSubtitleSelection.burnKey(): BurnKey? = when {
+        externalUrl != null -> BurnKey(externalUrl, delayMs, style)
+        embeddedIndex != null -> BurnKey("embedded:$embeddedIndex", delayMs, style)
+        else -> null
+    }
+
+    private fun isAdaptive(url: String): Boolean {
+        val type = CastMediaServer.contentTypeFromExtension(url) ?: return false
+        return type.contains("mpegurl", ignoreCase = true) || type.contains("dash", ignoreCase = true)
+    }
+
+    private fun describeVideo(convert: Boolean, burn: Boolean, encoder: String?): String = when {
+        burn -> "Converted to H.264 with subtitles" + if (encoder == SOFTWARE_H264_ENCODER) " (CPU)" else " (GPU)"
+        convert -> "Original video"
+        else -> "Streamed directly"
+    }
+
+    private fun describeAudio(label: String?, convert: Boolean, needsConversion: Boolean): String {
+        val codec = label?.let { Regex("""DTS-HD|DTS|TrueHD|E-AC-3(-JOC)?|AC-3|AAC|Opus|FLAC|MP3|Vorbis""", RegexOption.IGNORE_CASE).find(it)?.value }
+        return when {
+            convert && needsConversion -> "${codec ?: "Audio"} → stereo AAC"
+            convert -> "Stereo AAC"
+            needsConversion -> "${codec ?: "Original"} (may not play on the TV)"
+            codec != null -> codec
+            else -> "Original audio"
+        }
+    }
+
+    private fun describeSubtitles(
+        subtitles: CastSubtitleSelection,
+        burn: Boolean,
+        sideLoaded: Boolean,
+        pending: Boolean,
+        embedded: EmbeddedPlan?,
+    ): String {
+        val name = subtitles.displayName
+        return when {
+            subtitles.isOff -> "Off"
+            burn -> "$name · drawn into the video"
+            pending -> "$name · getting ready"
+            sideLoaded -> "$name · TV subtitle track"
+            embedded is EmbeddedPlan.Unmatched -> "$name · not found"
+            subtitles.isEmbedded && extraction?.failed == true -> "$name · couldn't be read"
+            subtitles.isEmbedded -> "$name · looking for it on the TV"
+            else -> "$name · couldn't be loaded"
+        }
+    }
+
+    internal fun phaseFor(status: CastMediaStatus): CastPhase = when {
+        status.isEnded -> CastPhase.Finished
+        status.playerState == CastPlayerState.Playing -> CastPhase.Playing
+        status.playerState == CastPlayerState.Paused -> CastPhase.Paused
+        status.playerState == CastPlayerState.Buffering -> CastPhase.Buffering
+        else -> CastPhase.Loading
+    }
+
+    /**
+     * Whether an early stop should be resumed: the stream had played, it stopped more than
+     * [RECOVERY_MIN_REMAINING_MS] before its end, and it hasn't been retried too often already.
+     */
+    internal fun shouldRecover(durationMs: Long, lastPositionMs: Long, reachedPlayback: Boolean, attempts: Int): Boolean =
+        reachedPlayback && durationMs > 0L && attempts < RECOVERY_MAX_ATTEMPTS &&
+            durationMs - lastPositionMs > RECOVERY_MIN_REMAINING_MS
+
+    /**
+     * Finds the ffmpeg subtitle stream for the track picked in the player. mpv numbers built-in
+     * tracks in file order before any added ones, so the index usually matches; language and
+     * name confirm it, and settle it when it doesn't.
+     */
+    internal fun matchEmbeddedStream(selection: CastSubtitleSelection, streams: List<CastSubtitleStream>): CastSubtitleStream? {
+        if (streams.isEmpty()) return null
+        val language = selection.embeddedLanguage?.lowercase()?.substringBefore('-')?.takeIf(String::isNotBlank)
+        fun sameLanguage(stream: CastSubtitleStream): Boolean =
+            language == null || stream.language == null || languageMatches(stream.language, language)
+        selection.embeddedIndex?.let(streams::getOrNull)?.takeIf(::sameLanguage)?.let { return it }
+        val candidates = streams.filter { stream -> language != null && stream.language != null && languageMatches(stream.language, language) }
+        val name = selection.embeddedName?.lowercase().orEmpty()
+        return candidates.firstOrNull { stream -> stream.title != null && name.contains(stream.title.lowercase()) }
+            ?: candidates.firstOrNull()
+    }
+
+    /** Language tags may be two- or three-letter ("en", "eng"); both sides may use either form. */
+    private fun languageMatches(a: String, b: String): Boolean {
+        val left = a.lowercase().substringBefore('-')
+        val right = b.lowercase().substringBefore('-')
+        return left == right || iso3(left) == iso3(right)
+    }
+
+    private fun iso3(code: String): String =
+        runCatching { java.util.Locale.forLanguageTag(code).isO3Language }.getOrNull()?.takeIf(String::isNotBlank) ?: code
 
     internal fun isLocalOnlyHost(url: String): Boolean {
         val host = runCatching { URI(url).host }.getOrNull()?.trim('[', ']') ?: return false
@@ -683,4 +1195,14 @@ internal object DesktopCastManager {
 
     private const val SIDE_LOADED_TRACK_ID = 1
     private const val SUBTITLE_FETCH_TIMEOUT_SECONDS = 15L
+    private const val RECONNECT_ATTEMPTS = 3
+    private const val RECONNECT_DELAY_MS = 1_500L
+    private const val COMMAND_SETTLE_MS = 2_000L
+    private const val RECOVERY_MAX_ATTEMPTS = 3
+    private const val RECOVERY_MIN_REMAINING_MS = 30_000L
+    private const val RECOVERY_RESET_MS = 5 * 60_000L
+    /** How long a load waits for built-in subtitles before starting without them. */
+    private const val EXTRACTION_WAIT_MS = 8_000L
+    private const val EXTRACTION_SLACK_MS = 5_000L
+    private val STEP_PHASES = setOf(CastPhase.Connecting, CastPhase.Preparing, CastPhase.Reconnecting)
 }

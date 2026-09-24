@@ -21,6 +21,12 @@ internal data class CastTranscodeSpec(
      */
     val burnSubtitlesFile: File? = null,
     val subtitleStyle: CastTextTrackStyle? = null,
+    /**
+     * A picture-based subtitle stream of the input (PGS, VobSub, DVB) to overlay while
+     * re-encoding: its position among the input's subtitle streams. Unlike text subtitles
+     * these need no extraction first, so they are drawn in the same pass.
+     */
+    val overlaySubtitleStream: Int? = null,
     /** H.264 encoder for burned-in video, from [CastTranscoder.videoEncoder]. */
     val videoEncoder: String = SOFTWARE_H264_ENCODER,
 )
@@ -30,7 +36,24 @@ internal const val SOFTWARE_H264_ENCODER = "libx264"
 internal data class CastMediaProbe(
     val durationMs: Long,
     val videoCodec: String?,
+    val subtitleStreams: List<CastSubtitleStream> = emptyList(),
 )
+
+/** A subtitle stream inside the media, in the order ffmpeg (and mpv) list them. */
+internal data class CastSubtitleStream(
+    /** Position among the input's subtitle streams: ffmpeg's `0:s:N`. */
+    val index: Int,
+    val codec: String,
+    val language: String?,
+    val title: String?,
+) {
+    /** Picture-based subtitles can be overlaid directly; text ones must be extracted first. */
+    val isBitmap: Boolean get() = codec.lowercase(Locale.ROOT) in BITMAP_SUBTITLE_CODECS
+
+    private companion object {
+        val BITMAP_SUBTITLE_CODECS = setOf("hdmv_pgs_subtitle", "pgssub", "dvd_subtitle", "dvdsub", "dvb_subtitle", "dvbsub", "xsub")
+    }
+}
 
 /**
  * Converts audio Chromecasts can't decode (DTS, TrueHD, AC-3/E-AC-3 without TV passthrough)
@@ -94,6 +117,64 @@ internal class CastTranscoder(private val extractDir: () -> File) {
             addAll(listOf("-map", "0:v:0", "-c", "copy", "-frames:v", "1", "-copyts", "-start_at_zero", "-f", "framecrc", "-"))
         }
         return runProcess(command)?.output?.let(::parseFirstPacketMs)
+    }
+
+    /**
+     * Copies subtitle stream [streamIndex] of the input into [output] as SubRip, starting at
+     * [fromMs] and keeping the original timestamps. Text subtitles are spread through the whole
+     * file, so this reads the rest of it: quick from disk, slower over the network. Reports how
+     * far it got (in media time) through [onProgress]. Blocking; returns false on failure or
+     * when [isCancelled] turns true.
+     */
+    fun extractSubtitles(
+        inputUrl: String,
+        headers: Map<String, String>,
+        streamIndex: Int,
+        fromMs: Long,
+        output: File,
+        onProgress: (positionMs: Long) -> Unit,
+        isCancelled: () -> Boolean,
+    ): Boolean {
+        val ffmpeg = binary() ?: return false
+        val partial = File(output.parentFile, output.name + ".part")
+        val process = ProcessBuilder(extractSubtitlesArguments(ffmpeg.absolutePath, inputUrl, headers, streamIndex, fromMs, partial))
+            .redirectErrorStream(true)
+            .start()
+        val tail = ArrayDeque<String>()
+        val reader = Thread({
+            runCatching {
+                process.inputStream.bufferedReader().forEachLine { line ->
+                    if (tail.size >= 10) tail.removeFirst()
+                    tail.addLast(line)
+                }
+            }
+        }, "nuvio-cast-subtitle-extract").apply {
+            isDaemon = true
+            start()
+        }
+        // ffmpeg reports no time for subtitle-only output; the last cue written shows how far it got.
+        var lastProgressCheck = 0L
+        while (!process.waitFor(250, TimeUnit.MILLISECONDS)) {
+            if (isCancelled()) {
+                process.destroyForcibly()
+                reader.join(1_000)
+                partial.delete()
+                return false
+            }
+            val now = System.currentTimeMillis()
+            if (now - lastProgressCheck >= 1_000) {
+                lastProgressCheck = now
+                lastCueStartMs(partial)?.let(onProgress)
+            }
+        }
+        reader.join(1_000)
+        if (process.exitValue() != 0 || !partial.isFile) {
+            log.w { "subtitle extraction failed (${process.exitValue()}): ${tail.joinToString(" | ")}" }
+            partial.delete()
+            return false
+        }
+        output.delete()
+        return partial.renameTo(output)
     }
 
     private class ProcessResult(val exitCode: Int, val output: String)
@@ -205,6 +286,7 @@ internal class CastTranscoder(private val extractDir: () -> File) {
         private val HARDWARE_H264_ENCODERS = listOf("h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox")
         /** Converted video is capped at 1080p: enough for the TV, and it keeps encoding real-time. */
         private const val MAX_BURN_HEIGHT = 1080
+        private const val BURN_SCALE = "scale=-2:'min($MAX_BURN_HEIGHT,ih)',format=yuv420p"
 
         private val isWindows: Boolean
             get() = System.getProperty("os.name").orEmpty().lowercase(Locale.ROOT).contains("win")
@@ -260,14 +342,25 @@ internal class CastTranscoder(private val extractDir: () -> File) {
             }
             add("-i")
             add(spec.inputUrl)
-            addAll(listOf("-map", "0:v:0", "-map", "0:a:${spec.audioTrackIndex.coerceAtLeast(0)}"))
-            if (burn != null) {
-                val subtitles = buildString {
-                    append("subtitles=filename=").append(burn.name)
-                    spec.subtitleStyle?.let { append(":force_style='").append(assForceStyle(it)).append('\'') }
+            val overlay = spec.overlaySubtitleStream?.takeIf { burn == null }
+            if (overlay != null) {
+                // Picture subtitles are drawn at the source size, then the result is scaled.
+                add("-filter_complex")
+                add("[0:v:0][0:s:$overlay]overlay=eof_action=pass,$BURN_SCALE[v]")
+                addAll(listOf("-map", "[v]"))
+            } else {
+                addAll(listOf("-map", "0:v:0"))
+            }
+            addAll(listOf("-map", "0:a:${spec.audioTrackIndex.coerceAtLeast(0)}"))
+            if (burn != null || overlay != null) {
+                if (burn != null) {
+                    val subtitles = buildString {
+                        append("subtitles=filename=").append(burn.name)
+                        spec.subtitleStyle?.let { append(":force_style='").append(assForceStyle(it)).append('\'') }
+                    }
+                    add("-vf")
+                    add("$BURN_SCALE,$subtitles")
                 }
-                add("-vf")
-                add("scale=-2:'min($MAX_BURN_HEIGHT,ih)',format=yuv420p,$subtitles")
                 addAll(listOf("-c:v", spec.videoEncoder))
                 addAll(encoderArguments(spec.videoEncoder))
                 addAll(listOf("-g", "48"))
@@ -280,6 +373,47 @@ internal class CastTranscoder(private val extractDir: () -> File) {
             addAll(listOf("-sn", "-dn", "-avoid_negative_ts", "make_zero"))
             addAll(listOf("-f", "mp4", "-movflags", "frag_keyframe+empty_moov+default_base_moof"))
             add("pipe:1")
+        }
+
+        internal fun extractSubtitlesArguments(
+            ffmpeg: String,
+            inputUrl: String,
+            headers: Map<String, String>,
+            streamIndex: Int,
+            fromMs: Long,
+            output: File,
+        ): List<String> = buildList {
+            add(ffmpeg)
+            addAll(listOf("-hide_banner", "-nostdin", "-loglevel", "error", "-nostats", "-y"))
+            addAll(inputArguments(inputUrl, headers))
+            if (fromMs > 0) {
+                add("-ss")
+                add(String.format(Locale.ROOT, "%.3f", fromMs / 1000.0))
+            }
+            add("-i")
+            add(inputUrl)
+            // -copyts keeps the cue times of the source, so one extraction serves every seek after it.
+            // Written cue by cue, so progress can be read from the file while it grows.
+            addAll(listOf("-copyts", "-map", "0:s:$streamIndex", "-c:s", "srt", "-flush_packets", "1", "-f", "srt", output.absolutePath))
+        }
+
+        /** Start of the last cue in a SubRip file still being written, from its last few KB. */
+        internal fun lastCueStartMs(file: File): Long? {
+            if (!file.isFile) return null
+            val text = runCatching {
+                java.io.RandomAccessFile(file, "r").use { input ->
+                    val start = (input.length() - 4_096).coerceAtLeast(0L)
+                    input.seek(start)
+                    ByteArray((input.length() - start).toInt()).also(input::readFully).decodeToString()
+                }
+            }.getOrNull() ?: return null
+            return lastCueStartMs(text)
+        }
+
+        internal fun lastCueStartMs(srt: String): Long? {
+            val match = Regex("""(\d+):(\d{2}):(\d{2})[,.](\d{3})\s*-->""").findAll(srt).lastOrNull() ?: return null
+            val (hours, minutes, seconds, millis) = match.destructured
+            return ((hours.toLong() * 60 + minutes.toLong()) * 60 + seconds.toLong()) * 1000 + millis.toLong()
         }
 
         internal fun encoderArguments(encoder: String): List<String> = when (encoder) {
@@ -334,7 +468,30 @@ internal class CastTranscoder(private val extractDir: () -> File) {
             }
             val videoCodec = Regex("""Stream #\d+:\d+.*?: Video: (\w+)""").find(output)?.groupValues?.get(1)
             if (duration == null && videoCodec == null) return null
-            return CastMediaProbe(durationMs = duration ?: 0L, videoCodec = videoCodec)
+            return CastMediaProbe(durationMs = duration ?: 0L, videoCodec = videoCodec, subtitleStreams = parseSubtitleStreams(output))
+        }
+
+        /** Subtitle streams from ffmpeg's input summary, with the title from each stream's metadata. */
+        internal fun parseSubtitleStreams(output: String): List<CastSubtitleStream> {
+            val lines = output.lines()
+            val streamLine = Regex("""^\s*Stream #0:\d+(?:\[\w+])?(?:\((\w+)\))?: (\w+): (\w+)""")
+            val streams = mutableListOf<CastSubtitleStream>()
+            lines.forEachIndexed { lineIndex, line ->
+                val match = streamLine.find(line) ?: return@forEachIndexed
+                val (language, type, codec) = match.destructured
+                if (type != "Subtitle") return@forEachIndexed
+                // The metadata block follows the stream line, indented deeper, until the next stream.
+                val title = lines.drop(lineIndex + 1)
+                    .takeWhile { !streamLine.containsMatchIn(it) && !it.trimStart().startsWith("Stream #") }
+                    .firstNotNullOfOrNull { Regex("""^\s+title\s*:\s*(.+)$""").find(it)?.groupValues?.get(1)?.trim() }
+                streams += CastSubtitleStream(
+                    index = streams.size,
+                    codec = codec,
+                    language = language.takeIf { it.isNotBlank() && it != "und" },
+                    title = title?.takeIf(String::isNotBlank),
+                )
+            }
+            return streams
         }
     }
 }
