@@ -8,7 +8,11 @@ import com.nuvio.app.features.player.PlayerSubtitleCueParser
  * subtitle delay is baked into the cue times because the receiver has no delay control.
  */
 internal object CastSubtitleConverter {
-    fun toWebVtt(text: String, sourceUrl: String?, delayMs: Int = 0): String? {
+    /**
+     * [plainText] drops markup (HTML-style tags, ASS override blocks) instead of escaping it,
+     * for subtitles ffmpeg draws into the picture, where escaped tags would show up literally.
+     */
+    fun toWebVtt(text: String, sourceUrl: String?, delayMs: Int = 0, plainText: Boolean = false): String? {
         val cues = PlayerSubtitleCueParser.parse(text, sourceUrl)
         if (cues.isEmpty()) return null
         return buildString {
@@ -17,11 +21,13 @@ internal object CastSubtitleConverter {
                 val start = (cue.startTimeMs + delayMs).coerceAtLeast(0L)
                 val end = (cue.endTimeMs + delayMs).coerceAtLeast(0L)
                 if (end <= start) return@forEach
+                val cueText = if (plainText) stripMarkup(cue.text) else cue.text
+                if (cueText.isBlank()) return@forEach
                 append(formatTimestamp(start))
                 append(" --> ")
                 append(formatTimestamp(end))
                 append('\n')
-                append(escapeCueText(cue.text))
+                append(escapeCueText(cueText))
                 append("\n\n")
             }
         }
@@ -36,6 +42,12 @@ internal object CastSubtitleConverter {
     }
 
     private fun Long.pad(width: Int): String = toString().padStart(width, '0')
+
+    internal fun stripMarkup(text: String): String =
+        text
+            .replace(Regex("""\{\\[^}]*}"""), "")
+            .replace(Regex("""<[^>]*>"""), "")
+            .replace("\\N", "\n")
 
     private fun escapeCueText(text: String): String =
         text

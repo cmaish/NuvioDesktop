@@ -38,3 +38,6 @@ iosApp/Configuration/DeviceSigning.local.json
 
 # Local MPVKit iOS build environment (sparse APFS image, see MPVKit docs)
 .mpvkit-build.sparseimage
+
+# ffmpeg for Chromecast audio conversion is downloaded by CI, never committed
+composeApp/src/desktopMain/resources/ffmpeg/

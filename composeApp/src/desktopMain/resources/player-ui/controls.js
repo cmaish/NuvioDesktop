@@ -31,6 +31,18 @@ const castButton = document.getElementById("castButton");
 const castIcon = document.getElementById("castIcon");
 const castBanner = document.getElementById("castBanner");
 const castBannerText = document.getElementById("castBannerText");
+const castBannerStatus = document.getElementById("castBannerStatus");
+const castBannerSpinner = document.getElementById("castBannerSpinner");
+const castBannerDetails = document.getElementById("castBannerDetails");
+const castVideoRow = document.getElementById("castVideoRow");
+const castVideoInfo = document.getElementById("castVideoInfo");
+const castAudioRow = document.getElementById("castAudioRow");
+const castAudioInfo = document.getElementById("castAudioInfo");
+const castSubtitleRow = document.getElementById("castSubtitleRow");
+const castSubtitleInfo = document.getElementById("castSubtitleInfo");
+const castSubtitleProgress = document.getElementById("castSubtitleProgress");
+const castSubtitleProgressBar = document.getElementById("castSubtitleProgressBar");
+const castScrim = document.getElementById("castScrim");
 const castModal = document.getElementById("castModal");
 const castPanelTitle = document.getElementById("castPanelTitle");
 const castRefreshButton = document.getElementById("castRefreshButton");
@@ -328,6 +340,13 @@ let state = {
   castIsLoading: false,
   castErrorMessage: "",
   castErrorToken: 0,
+  castPhase: "idle",
+  castPhaseLabel: "",
+  castVideoInfo: "",
+  castAudioInfo: "",
+  castSubtitleInfo: "",
+  castSubtitleProgress: null,
+  castVolumeLevel: null,
   durationMs: 0,
   positionMs: 0,
   audioTracks: [],
@@ -918,6 +937,7 @@ const renderPauseMetadataOverlay = showOpening => {
   const descriptionText = String(state.pauseOverlayDescription || "").trim();
   const showOverlay = Boolean(
     pauseMetadataReady &&
+    !isCasting() &&
     !state.controlsVisible &&
     !activeModal &&
     !showOpening,
@@ -1946,6 +1966,10 @@ const renderSubmitIntroModal = () => {
 const formatCastLabel = (template, deviceName) =>
   String(template || "").replace("%s", deviceName || "");
 
+let renderedCastDeviceSignature = "";
+// The TV reports its volume back with a delay; don't let that pull the slider while it moves.
+let lastLocalVolumeChangeAt = 0;
+
 const renderCastModal = () => {
   const castState = state.castState || "idle";
   const deviceName = state.castDeviceName || "";
@@ -1964,8 +1988,12 @@ const renderCastModal = () => {
   } else {
     castStatus.textContent = "";
   }
-  castDeviceList.textContent = "";
   const devices = Array.isArray(state.castDevices) ? state.castDevices : [];
+  // Rebuilding the rows under the pointer swallows clicks, and status updates arrive often.
+  const listSignature = JSON.stringify([Boolean(state.castDiscovering), devices]);
+  if (listSignature === renderedCastDeviceSignature) return;
+  renderedCastDeviceSignature = listSignature;
+  castDeviceList.textContent = "";
   if (devices.length === 0) {
     if (!state.castDiscovering) {
       appendEmptyTrackState(castDeviceList, state.castNoDevicesLabel || "No Cast devices found on this network");
@@ -1980,6 +2008,8 @@ const renderCastModal = () => {
       event.stopPropagation();
       if (device.isActive) return;
       send("castSelectDevice", Number(device.index) || 0);
+      // Progress shows on the cast card from here on.
+      closePlayerModal();
     });
     const copy = document.createElement("span");
     copy.className = "cast-device-copy";
@@ -2018,6 +2048,27 @@ const syncCastChrome = () => {
     castBanner.classList.toggle("visible", casting);
     castBanner.setAttribute("aria-hidden", casting ? "false" : "true");
   }
+  if (castBannerStatus) castBannerStatus.textContent = casting ? state.castPhaseLabel || "" : "";
+  if (castBannerSpinner) castBannerSpinner.hidden = !(casting && state.castIsLoading);
+  const setCastRow = (row, value, text) => {
+    if (!row || !value) return false;
+    const content = casting ? String(text || "").trim() : "";
+    value.textContent = content;
+    row.hidden = !content;
+    return Boolean(content);
+  };
+  const hasVideo = setCastRow(castVideoRow, castVideoInfo, state.castVideoInfo);
+  const hasAudio = setCastRow(castAudioRow, castAudioInfo, state.castAudioInfo);
+  const hasSubtitles = setCastRow(castSubtitleRow, castSubtitleInfo, state.castSubtitleInfo);
+  if (castBannerDetails) castBannerDetails.hidden = !(hasVideo || hasAudio || hasSubtitles);
+  const subtitleProgress = Number(state.castSubtitleProgress);
+  const showProgress = casting && state.castSubtitleProgress !== null && state.castSubtitleProgress !== undefined &&
+    Number.isFinite(subtitleProgress);
+  if (castSubtitleProgress) castSubtitleProgress.hidden = !showProgress;
+  if (castSubtitleProgressBar && showProgress) {
+    castSubtitleProgressBar.style.width = `${Math.round(Math.max(0, Math.min(1, subtitleProgress)) * 100)}%`;
+  }
+  if (castScrim) castScrim.classList.toggle("visible", casting);
 };
 
 // While casting, the timeline and play state mirror the receiver instead of the paused local player.
@@ -2030,13 +2081,20 @@ const applyCastPlaybackState = () => {
     window.clearTimeout(pendingPlaybackTimer);
     pendingPlaybackTimer = 0;
   }
+  const castVolume = Number(state.castVolumeLevel);
+  const hasCastVolume = state.castVolumeLevel !== null && state.castVolumeLevel !== undefined && Number.isFinite(castVolume);
   state = {
     ...state,
     durationMs: Math.max(0, Number(state.castDurationMs) || 0),
     positionMs: Math.max(0, Number(state.castPositionMs) || 0),
     isPlaying: pendingIsPlaying === null ? castIsPlaying : pendingIsPlaying,
     isLoading: Boolean(state.castIsLoading),
+    // The slider shows (and sets) the TV's volume; not while it is being dragged.
+    volumeLevel: hasCastVolume && Date.now() - lastLocalVolumeChangeAt > 2000
+      ? Math.max(0, Math.min(1, castVolume))
+      : state.volumeLevel,
   };
+  syncVolumeControl();
 };
 
 const renderP2pConsentModal = () => {
@@ -2406,7 +2464,7 @@ const renderChrome = () => {
     pipButton.hidden = !pipLabel;
   }
   syncPipLockLabels();
-  const showBuffering = Boolean(!showError && state.isLoading && !activeModal && !showOpening);
+  const showBuffering = Boolean(!showError && state.isLoading && !activeModal && !showOpening && !isCasting());
   bufferingStatus.classList.toggle("visible", showBuffering);
   bufferingStatus.setAttribute("aria-hidden", showBuffering ? "false" : "true");
 
@@ -2644,6 +2702,7 @@ const sendKeyboardVolume = delta => {
   const nextLevel = delta > 0
     ? Math.min(standardMaxVolumeLevel, clampVolumeLevel(adjustedLevel))
     : clampVolumeLevel(adjustedLevel);
+  lastLocalVolumeChangeAt = Date.now();
   state.volumeLevel = nextLevel;
   if (nextLevel > 0) {
     preMuteVolumeLevel = nextLevel;
@@ -3103,6 +3162,7 @@ volumeSlider.addEventListener("input", event => {
   noteChromeActivity();
   const percent = Math.max(0, Math.min(maxVolumeLevel * 100, Number(volumeSlider.value) || 0));
   const nextLevel = percent / 100;
+  lastLocalVolumeChangeAt = Date.now();
   state.volumeLevel = nextLevel;
   if (nextLevel > 0) {
     preMuteVolumeLevel = nextLevel;
@@ -3116,6 +3176,7 @@ let preMuteVolumeLevel = 1.0;
 
 volumeButton.addEventListener("click", () => {
   noteChromeActivity();
+  lastLocalVolumeChangeAt = Date.now();
   if (state.volumeLevel > 0) {
     preMuteVolumeLevel = state.volumeLevel;
     state.volumeLevel = 0;
@@ -3151,7 +3212,7 @@ window.playerUpdate = update => {
     positionMs: casting ? state.positionMs : positionMs,
     isPlaying: pendingIsPlaying === null ? nativeIsPlaying : pendingIsPlaying,
     isLoading: casting ? state.isLoading : Boolean(update.loading || update.isLoading),
-    volumeLevel,
+    volumeLevel: casting ? state.volumeLevel : volumeLevel,
     audioTracks,
     subtitleTracks,
   };
@@ -3217,6 +3278,9 @@ window.playerControls = nextState => {
     showPlayerToast(state.castErrorMessage, { durationMs: 4000, icon: "icon-cast" });
   }
   applyCastPlaybackState();
+  if (previousCastState === "idle" && (state.castState || "idle") !== "idle" && activeModal === "cast") {
+    closePlayerModal();
+  }
   if (previousCastState !== "idle" && (state.castState || "idle") === "idle") {
     // Hand the play state back to the local player's own reports.
     pendingIsPlaying = null;

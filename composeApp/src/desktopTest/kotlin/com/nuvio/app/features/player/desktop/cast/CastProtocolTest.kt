@@ -135,6 +135,26 @@ class CastProtocolTest {
     }
 
     @Test
+    fun `changing subtitles keeps the active audio track`() {
+        // Audio track 2 and side-loaded text track 1 are active; subtitles are turned off.
+        assertEquals(listOf(2), CastSession.mergeActiveTrackIds(listOf(1, 2), setOf(1), emptyList()))
+        // Switching to the receiver's own text track 5.
+        assertEquals(listOf(2, 5), CastSession.mergeActiveTrackIds(listOf(1, 2), setOf(1, 5), listOf(5)))
+        // Switching audio from 2 to 3 keeps the text track.
+        assertEquals(listOf(1, 3), CastSession.mergeActiveTrackIds(listOf(1, 2), setOf(2, 3), listOf(3)))
+    }
+
+    @Test
+    fun `unsupported audio codecs produce a warning`() {
+        assertTrue(DesktopCastManager.unsupportedAudioWarning("English · 5.1 · DTS-HD", "TV")!!.contains("DTS-HD"))
+        assertTrue(DesktopCastManager.unsupportedAudioWarning("English · 7.1 · TrueHD", "TV")!!.contains("TrueHD"))
+        assertTrue(DesktopCastManager.unsupportedAudioWarning("English · 5.1 · E-AC-3", "TV")!!.contains("E-AC-3"))
+        assertTrue(DesktopCastManager.unsupportedAudioWarning("Track 1 · AC3", "TV") != null)
+        assertEquals(null, DesktopCastManager.unsupportedAudioWarning("English · Stereo · AAC", "TV"))
+        assertEquals(null, DesktopCastManager.unsupportedAudioWarning(null, "TV"))
+    }
+
+    @Test
     fun `local only hosts are detected for proxying`() {
         assertTrue(DesktopCastManager.isLocalOnlyHost("http://127.0.0.1:8090/stream/file.mkv"))
         assertTrue(DesktopCastManager.isLocalOnlyHost("http://localhost:8090/play"))

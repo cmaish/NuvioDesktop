@@ -104,6 +104,7 @@
   </svg>
 
   <div class="player" id="playerRoot" tabindex="-1">
+    <div class="cast-scrim" id="castScrim" aria-hidden="true"></div>
     <div class="top-gradient"></div>
     <div class="bottom-gradient"></div>
     <div class="pip-lock-overlay" id="pipLockOverlay" aria-hidden="true"></div>
@@ -161,8 +162,22 @@
       </section>
 
       <section class="cast-banner" id="castBanner" aria-live="polite" aria-hidden="true">
-        <svg class="cast-banner-icon" aria-hidden="true"><use href="#icon-cast-connected"></use></svg>
-        <span class="cast-banner-text" id="castBannerText"></span>
+        <div class="cast-banner-head">
+          <svg class="cast-banner-icon" aria-hidden="true"><use href="#icon-cast-connected"></use></svg>
+          <div class="cast-banner-copy">
+            <span class="cast-banner-text" id="castBannerText"></span>
+            <span class="cast-banner-status" id="castBannerStatus"></span>
+          </div>
+          <span class="cast-banner-spinner" id="castBannerSpinner" aria-hidden="true"></span>
+        </div>
+        <dl class="cast-banner-details" id="castBannerDetails">
+          <div class="cast-banner-row" id="castVideoRow"><dt>Video</dt><dd id="castVideoInfo"></dd></div>
+          <div class="cast-banner-row" id="castAudioRow"><dt>Audio</dt><dd id="castAudioInfo"></dd></div>
+          <div class="cast-banner-row" id="castSubtitleRow"><dt>Subtitles</dt><dd id="castSubtitleInfo"></dd></div>
+        </dl>
+        <div class="cast-banner-progress" id="castSubtitleProgress" hidden>
+          <div class="cast-banner-progress-bar" id="castSubtitleProgressBar"></div>
+        </div>
       </section>
 
       <section class="playback-error" id="playbackError" aria-label="Playback error" aria-hidden="true">

@@ -68,6 +68,7 @@ internal data class CastMediaStatus(
     val muted: Boolean = false,
     val activeTrackIds: List<Int> = emptyList(),
     val receiverTextTracks: List<CastReceiverTrack> = emptyList(),
+    val receiverAudioTracks: List<CastReceiverTrack> = emptyList(),
 ) {
     val isEnded: Boolean get() = playerState == CastPlayerState.Idle && idleReason == "FINISHED"
     val isFailed: Boolean get() = playerState == CastPlayerState.Idle && idleReason == "ERROR"
@@ -81,7 +82,8 @@ internal data class CastMediaStatus(
 internal class CastSession(
     val device: CastDevice,
     private val onStatus: (CastMediaStatus) -> Unit,
-    private val onEnded: (reason: String?) -> Unit,
+    /** [connectionLost] is true when the network connection dropped, rather than the receiver ending the session. */
+    private val onEnded: (reason: String?, connectionLost: Boolean) -> Unit,
 ) {
     private val log = Logger.withTag("CastSession")
     private val requestIds = AtomicInteger(1)
@@ -91,7 +93,7 @@ internal class CastSession(
         host = device.host,
         port = device.port,
         onMessage = ::handleMessage,
-        onClosed = { error -> finish(error?.message ?: "Connection closed") },
+        onClosed = { error -> finish(error?.message ?: "Connection closed", connectionLost = error != null) },
     )
 
     @Volatile private var transportId: String? = null
@@ -102,22 +104,45 @@ internal class CastSession(
     @Volatile private var lastStatusAtMs = System.currentTimeMillis()
     @Volatile private var receiverVolume: Float? = null
     @Volatile private var receiverMuted = false
+    /** Text track ids we side-loaded with the current media; the receiver's own ones come from status. */
+    @Volatile private var sideLoadedTextTrackIds: Set<Int> = emptySet()
     private var pollThread: Thread? = null
 
-    /** Connects and launches the Default Media Receiver. Blocking; call off the UI thread. */
-    fun start() {
-        channel.connect()
+    /**
+     * Connects and launches the Default Media Receiver. With [joinExisting], a receiver app that
+     * is still running (after a dropped connection) is rejoined instead of relaunched, so what
+     * it plays keeps going. Blocking; call off the UI thread.
+     */
+    fun start(joinExisting: Boolean = false) {
+        // A TV that was just woken up (or a busy Wi-Fi link) often refuses the first attempt.
+        runCatching { channel.connect() }.getOrElse { error ->
+            log.d { "cast connect to ${device.name} failed, retrying: ${error.message}" }
+            Thread.sleep(CONNECT_RETRY_DELAY_MS)
+            channel.connect()
+        }
         channel.send(CastNamespaces.CONNECTION, CastChannel.RECEIVER_ID, connectPayload())
-        val launchId = nextRequestId()
-        channel.send(
-            CastNamespaces.RECEIVER,
-            CastChannel.RECEIVER_ID,
-            buildJsonObject {
-                put("type", "LAUNCH")
-                put("appId", DEFAULT_MEDIA_RECEIVER_APP_ID)
-                put("requestId", launchId)
-            }.toString(),
-        )
+        val running = joinExisting && run {
+            channel.send(
+                CastNamespaces.RECEIVER,
+                CastChannel.RECEIVER_ID,
+                buildJsonObject {
+                    put("type", "GET_STATUS")
+                    put("requestId", nextRequestId())
+                }.toString(),
+            )
+            runCatching { appReady.get(JOIN_STATUS_TIMEOUT_SECONDS, TimeUnit.SECONDS) }.isSuccess
+        }
+        if (!running) {
+            channel.send(
+                CastNamespaces.RECEIVER,
+                CastChannel.RECEIVER_ID,
+                buildJsonObject {
+                    put("type", "LAUNCH")
+                    put("appId", DEFAULT_MEDIA_RECEIVER_APP_ID)
+                    put("requestId", nextRequestId())
+                }.toString(),
+            )
+        }
         val (transport, session) = try {
             appReady.get(LAUNCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         } catch (error: Exception) {
@@ -139,10 +164,14 @@ internal class CastSession(
         val requestId = nextRequestId()
         val future = CompletableFuture<JsonObject>()
         pendingRequests[requestId] = future
+        sideLoadedTextTrackIds = request.textTracks.map { it.id }.toSet()
         lastStatus = lastStatus.copy(
             playerState = CastPlayerState.Loading,
             idleReason = null,
             positionMs = request.startPositionMs,
+            activeTrackIds = request.activeTextTrackIds,
+            receiverTextTracks = emptyList(),
+            receiverAudioTracks = emptyList(),
         )
         lastStatusAtMs = System.currentTimeMillis()
         channel.send(CastNamespaces.MEDIA, transport, buildLoadPayload(request, requestId, sessionId).toString())
@@ -164,6 +193,35 @@ internal class CastSession(
         }
     }
 
+    /**
+     * Asks the receiver what it is playing, e.g. after reconnecting to a session that kept
+     * running. Returns null when nothing is loaded. Blocking; call off the UI thread.
+     */
+    fun refreshMediaStatus(): CastMediaStatus? {
+        val transport = transportId ?: return null
+        val requestId = nextRequestId()
+        val future = CompletableFuture<JsonObject>()
+        pendingRequests[requestId] = future
+        channel.send(
+            CastNamespaces.MEDIA,
+            transport,
+            buildJsonObject {
+                put("type", "GET_STATUS")
+                put("requestId", requestId)
+            }.toString(),
+        )
+        val response = try {
+            future.get(STATUS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        } catch (_: Exception) {
+            return null
+        } finally {
+            pendingRequests.remove(requestId)
+        }
+        val entry = response["status"]?.asArray()?.firstOrNull()?.asObject() ?: return null
+        if (entry["playerState"]?.jsonPrimitive?.contentOrNull == "IDLE") return null
+        return lastStatus
+    }
+
     fun play() = sendMediaCommand("PLAY")
 
     fun pause() = sendMediaCommand("PAUSE")
@@ -176,11 +234,31 @@ internal class CastSession(
 
     fun setPlaybackRate(rate: Float) = sendMediaCommand("SET_PLAYBACK_RATE") { put("playbackRate", rate.toDouble()) }
 
+    /**
+     * Activates [trackIds] as the text tracks. activeTrackIds covers every track type, so the
+     * currently active audio/video tracks are carried over; sending only text ids would switch
+     * the receiver's audio off.
+     */
     fun setActiveTextTracks(trackIds: List<Int>, style: CastTextTrackStyle?) {
+        val status = lastStatus
+        val textIds = sideLoadedTextTrackIds + status.receiverTextTracks.map { it.id }
+        editActiveTracks(mergeActiveTrackIds(status.activeTrackIds, textIds, trackIds), style)
+    }
+
+    /** Switches to one of the audio tracks the receiver reported for the current media. */
+    fun setActiveAudioTrack(trackId: Int) {
+        val status = lastStatus
+        val audioIds = status.receiverAudioTracks.map { it.id }.toSet()
+        if (trackId !in audioIds) return
+        editActiveTracks(mergeActiveTrackIds(status.activeTrackIds, audioIds, listOf(trackId)), style = null)
+    }
+
+    private fun editActiveTracks(activeIds: List<Int>, style: CastTextTrackStyle?) {
         sendMediaCommand("EDIT_TRACKS_INFO") {
-            putJsonArray("activeTrackIds") { trackIds.forEach { add(JsonPrimitive(it)) } }
+            putJsonArray("activeTrackIds") { activeIds.forEach { add(JsonPrimitive(it)) } }
             style?.let { put("textTrackStyle", it.toJson()) }
         }
+        lastStatus = lastStatus.copy(activeTrackIds = activeIds)
     }
 
     fun setVolume(level: Float) {
@@ -291,7 +369,7 @@ internal class CastSession(
         val requestId = payload["requestId"]?.jsonPrimitive?.intOrNull
         when (namespace) {
             CastNamespaces.CONNECTION -> if (type == "CLOSE" && sourceId == transportId) {
-                finish("The receiver closed the session")
+                finish("The receiver closed the session", connectionLost = false)
             }
             CastNamespaces.RECEIVER -> when (type) {
                 "RECEIVER_STATUS" -> handleReceiverStatus(payload)
@@ -324,11 +402,11 @@ internal class CastSession(
             val session = ours["sessionId"]?.jsonPrimitive?.contentOrNull
             if (transport != null && session != null) {
                 if (!appReady.isDone) appReady.complete(transport to session)
-                if (sessionId != null && session != sessionId) finish("Another sender took over ${device.name}")
+                if (sessionId != null && session != sessionId) finish("Another sender took over ${device.name}", connectionLost = false)
             }
         } else if (sessionId != null) {
             // Someone stopped the receiver app, or another app replaced it.
-            finish("Casting stopped on ${device.name}")
+            finish("Casting stopped on ${device.name}", connectionLost = false)
         }
     }
 
@@ -348,18 +426,9 @@ internal class CastSession(
             ?.takeIf { it.isFinite() && it > 0.0 }
             ?.let { (it * 1000).toLong() }
             ?: lastStatus.durationMs
-        val receiverTracks = media?.get("tracks")?.asArray()?.let { tracks ->
-            tracks.mapNotNull { it.asObject() }
-                .filter { it["type"]?.jsonPrimitive?.contentOrNull == "TEXT" }
-                .mapNotNull { track ->
-                    val id = track["trackId"]?.jsonPrimitive?.intOrNull ?: return@mapNotNull null
-                    CastReceiverTrack(
-                        id = id,
-                        name = track["name"]?.jsonPrimitive?.contentOrNull.orEmpty(),
-                        language = track["language"]?.jsonPrimitive?.contentOrNull,
-                    )
-                }
-        } ?: lastStatus.receiverTextTracks
+        val mediaTracks = media?.get("tracks")?.asArray()?.mapNotNull { it.asObject() }
+        val receiverTracks = mediaTracks?.let { receiverTracksOfType(it, "TEXT") } ?: lastStatus.receiverTextTracks
+        val receiverAudio = mediaTracks?.let { receiverTracksOfType(it, "AUDIO") } ?: lastStatus.receiverAudioTracks
         val volume = entry["volume"]?.asObject()
         val next = lastStatus.copy(
             playerState = playerState,
@@ -376,6 +445,7 @@ internal class CastSession(
                 ?.mapNotNull { it.jsonPrimitive.intOrNull }
                 ?: lastStatus.activeTrackIds,
             receiverTextTracks = receiverTracks,
+            receiverAudioTracks = receiverAudio,
         )
         publish(next, resetClock = true)
     }
@@ -386,7 +456,7 @@ internal class CastSession(
         if (!ended) onStatus(status)
     }
 
-    private fun finish(reason: String?) {
+    private fun finish(reason: String?, connectionLost: Boolean) {
         if (ended) return
         ended = true
         pendingRequests.values.forEach { it.completeExceptionally(IllegalStateException(reason)) }
@@ -395,7 +465,7 @@ internal class CastSession(
         channel.close()
         pollThread?.interrupt()
         log.d { "cast session ended device=${device.name} reason=$reason" }
-        onEnded(reason)
+        onEnded(reason, connectionLost)
     }
 
     private fun nextRequestId(): Int = requestIds.getAndIncrement()
@@ -405,6 +475,9 @@ internal class CastSession(
         private const val LAUNCH_TIMEOUT_SECONDS = 20L
         private const val LOAD_TIMEOUT_SECONDS = 30L
         private const val STATUS_POLL_INTERVAL_MS = 4_000L
+        private const val STATUS_TIMEOUT_SECONDS = 5L
+        private const val CONNECT_RETRY_DELAY_MS = 1_500L
+        private const val JOIN_STATUS_TIMEOUT_SECONDS = 3L
 
         private fun connectPayload(): String =
             buildJsonObject {
@@ -476,6 +549,21 @@ internal class CastSession(
                     put("edgeColor", "#000000FF")
                 }
             }
+
+        internal fun mergeActiveTrackIds(current: List<Int>, replacedIds: Set<Int>, next: List<Int>): List<Int> =
+            (current.filterNot { it in replacedIds } + next).distinct()
+
+        private fun receiverTracksOfType(tracks: List<JsonObject>, type: String): List<CastReceiverTrack> =
+            tracks
+                .filter { it["type"]?.jsonPrimitive?.contentOrNull == type }
+                .mapNotNull { track ->
+                    val id = track["trackId"]?.jsonPrimitive?.intOrNull ?: return@mapNotNull null
+                    CastReceiverTrack(
+                        id = id,
+                        name = track["name"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+                        language = track["language"]?.jsonPrimitive?.contentOrNull,
+                    )
+                }
 
         private fun JsonElement.asObject(): JsonObject? = this as? JsonObject
         private fun JsonElement.asArray(): JsonArray? = this as? JsonArray

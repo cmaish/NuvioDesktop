@@ -3481,20 +3481,37 @@ svg {
   display: none;
 }
 
+/* While casting the local picture is frozen: dim it and say what the TV is doing instead. */
+.cast-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background: rgba(0, 0, 0, .66);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--motion-panel) ease;
+}
+
+.cast-scrim.visible {
+  opacity: 1;
+}
+
 .cast-banner {
   position: absolute;
   left: 50%;
-  top: 28%;
+  top: calc(var(--vp) + var(--header-button) + 24px);
   z-index: 2;
   display: flex;
-  align-items: center;
+  flex-direction: column;
   gap: 12px;
-  max-width: calc(100% - 48px);
-  padding: 12px 20px;
-  border-radius: 999px;
-  background: rgba(0, 0, 0, .62);
+  width: min(420px, calc(100% - 32px));
+  padding: 16px 18px;
+  border-radius: 16px;
+  background: rgba(16, 17, 22, .82);
+  border: 1px solid rgba(255, 255, 255, .08);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, .35);
   color: var(--theme-text-primary);
-  font-size: 16px;
+  font-size: 15px;
   line-height: 1.3;
   opacity: 0;
   pointer-events: none;
@@ -3509,20 +3526,136 @@ svg {
   transform: translate(-50%, 0);
 }
 
+.cast-banner-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
 .cast-banner-icon {
   flex: 0 0 auto;
-  width: 24px;
-  height: 24px;
+  width: 28px;
+  height: 28px;
   color: var(--theme-accent);
 }
 
-.cast-banner-text {
+.cast-banner-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.cast-banner-text,
+.cast-banner-status {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.cast-banner-text {
+  font-weight: 600;
+}
+
+.cast-banner-status {
+  color: var(--theme-text-secondary);
+  font-size: 13px;
+}
+
+.cast-banner-spinner {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(255, 255, 255, .22);
+  border-top-color: var(--theme-text-primary);
+  border-radius: 50%;
+  animation: cast-spin .9s linear infinite;
+}
+
+.cast-banner-spinner[hidden] {
+  display: none;
+}
+
+@keyframes cast-spin {
+  to { transform: rotate(360deg); }
+}
+
+.cast-banner-details {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, .08);
+  font-size: 13px;
+}
+
+.cast-banner-details:empty,
+.cast-banner-details[hidden],
+.cast-banner-row[hidden] {
+  display: none;
+}
+
+.cast-banner-row {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.cast-banner-row dt {
+  color: var(--theme-text-muted);
+}
+
+.cast-banner-row dd {
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--theme-text-secondary);
+}
+
+.cast-banner-progress {
+  height: 3px;
+  border-radius: 999px;
+  background: var(--theme-buffering-track);
+  overflow: hidden;
+}
+
+.cast-banner-progress[hidden] {
+  display: none;
+}
+
+.cast-banner-progress-bar {
+  width: 0;
+  height: 100%;
+  background: var(--theme-accent);
+  transition: width var(--motion-standard) ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cast-banner-spinner {
+    animation: none;
+  }
+}
+
+/* Small windows: keep the card to its two status lines, clear of the title and timeline. */
+@media (max-height: 460px) {
+  .cast-banner {
+    gap: 0;
+    padding: 10px 14px;
+    top: calc(var(--vp) + var(--header-button) + 12px);
+  }
+
+  .cast-banner-details,
+  .cast-banner-progress {
+    display: none;
+  }
+}
+
+.player.pip-mode .cast-scrim,
 .player.pip-mode .cast-banner {
   display: none;
 }
